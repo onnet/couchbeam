@@ -20,6 +20,8 @@
          show/2, show/3, show/4
         ]).
 
+-define(TIMEOUT, 30000).
+
 -spec all(Db::db()) -> {ok, Rows::list(ejson_object())} | {error, term()} | {error, term(), Rows::list(ejson_object())}.
 %% @doc fetch all docs
 %% @equiv fetch(Db, 'all_docs', [])
@@ -537,7 +539,7 @@ collect_view_results(Ref, Acc) ->
             %% in case we got some results
             Rows = lists:reverse(Acc),
             {error, Error, Rows}
-    after 30000 ->
+    after ?TIMEOUT ->
             {error, timeout}
     end.
 
