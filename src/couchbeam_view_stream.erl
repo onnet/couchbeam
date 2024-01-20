@@ -42,7 +42,7 @@
                  async=false}).
 
 
--define(TIMEOUT, 10000).
+-define(TIMEOUT, 40000).
 -define(DEFAULT_CHANGES_POLL, 5000). % we check every 5secs
 
 
