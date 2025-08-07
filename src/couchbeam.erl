@@ -833,9 +833,14 @@ put_attachment(Db, DocId, Name, Body)->
 %%       initial_state() = term()
 put_attachment(#db{server=Server, options=Opts}=Db, DocId, Name, Body,
                Options) ->
+    WriteArgs = case couchbeam_util:get_value(w, Options) of
+                    undefined -> [];
+                    Write -> [{<<"w">>, couchbeam_util:to_binary(Write)}]
+                 end,
+
     QueryArgs = case couchbeam_util:get_value(rev, Options) of
                     undefined -> [];
-                    Rev -> [{<<"rev">>, couchbeam_util:to_binary(Rev)}]
+                    Rev -> [{<<"rev">>, couchbeam_util:to_binary(Rev)}|WriteArgs]
                 end,
 
     Headers = couchbeam_util:get_value(headers, Options, []),
