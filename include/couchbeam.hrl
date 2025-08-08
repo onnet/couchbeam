@@ -91,7 +91,7 @@
     | {limit, integer()}
     | {stale, stale()}
     | {stable, boolean()}
-    | {update, boolean()}
+    | {update, atom()}
     | descending
     | {skip, integer()}
     | group | {group_level, exact | integer()}

@@ -506,6 +506,9 @@ parse_view_options([{update, true}|Rest], #view_query_args{options=Opts}=Args) -
 parse_view_options([{update, false}|Rest], #view_query_args{options=Opts}=Args) ->
     Opts1 = [{update, "false"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
+parse_view_options([{update, lazy}|Rest], #view_query_args{options=Opts}=Args) ->
+    Opts1 = [{update, "lazy"}|Opts],
+    parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([descending|Rest], #view_query_args{options=Opts}=Args) ->
     Opts1 = [{descending, "true"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
