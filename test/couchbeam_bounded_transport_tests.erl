@@ -844,6 +844,14 @@ bounded_view_cleanup_uses_guardian_deadline_when_manager_suspended_test() ->
                                             Db, 'all_docs', [], {100, 1024}),
                                  Parent ! {'view_cleanup_result', self(),
                                            Result},
+                                 receive
+                                     'inspect_view_cleanup_mailbox' ->
+                                         {'messages', Messages} =
+                                             process_info(self(), messages),
+                                         Parent ! {
+                                           'view_cleanup_mailbox', self(),
+                                           Messages}
+                                 end,
                                  receive 'stop_view_cleanup_caller' -> 'ok' end
                          end),
               {GuardianPid, WorkerPid, ViewPid} = receive
@@ -907,10 +915,184 @@ bounded_view_cleanup_uses_guardian_deadline_when_manager_suspended_test() ->
               after 500 ->
                       ?assert('false')
               end,
+              Caller ! 'inspect_view_cleanup_mailbox',
+              receive
+                  {'view_cleanup_mailbox', Caller, []} -> 'ok';
+                  {'view_cleanup_mailbox', Caller, Messages} ->
+                      ?assertEqual([], Messages)
+              after 200 ->
+                      ?assert('false')
+              end,
               Caller ! 'stop_view_cleanup_caller',
               receive
                   {'DOWN', GuardianMonitor, 'process', GuardianPid, _} -> 'ok'
               after 200 ->
+                      ?assert('false')
+              end
+      end).
+
+bounded_body_close_propagates_cleanup_timeout_for_concrete_ref_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    Parent = self(),
+    Body = <<"{\"db_name\":\"db\"}">>,
+    with_http_server(
+      fun(Socket, ServerParent) ->
+              ServerParent ! {'body_cleanup_request_ready', self()},
+              receive 'send_body_cleanup_response' -> 'ok' end,
+              'ok' = send_json_response(Socket, Body),
+              _ = recv_until_closed(Socket),
+              ServerParent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'bounded_guardian_started_test_hook', Parent},
+                          {'bounded_handoff_test_hook', Parent}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Caller = spawn(
+                         fun() ->
+                                 Result = couchbeam:db_info_bounded(
+                                            Db, {100, 1024}),
+                                 Parent ! {'body_cleanup_result', self(),
+                                           Result},
+                                 receive
+                                     'inspect_body_cleanup_mailbox' ->
+                                         {'messages', Messages} =
+                                             process_info(self(), messages),
+                                         Parent ! {
+                                           'body_cleanup_mailbox', self(),
+                                           Messages}
+                                 end,
+                                 receive 'stop_body_cleanup_caller' -> 'ok' end
+                         end),
+              {GuardianPid, LeasePid} = receive
+                  {'bounded_guardian_started_ready', Guardian, _Worker, Lease,
+                   Caller} ->
+                      Guardian ! {'bounded_guardian_started_continue',
+                                  Guardian},
+                      {Guardian, Lease}
+              after 1000 ->
+                      exit(Caller, 'kill'),
+                      ?assert('false')
+              end,
+              Ref = receive
+                        {'bounded_handoff_ready', CapturedRef, Caller} ->
+                            Caller ! {'bounded_handoff_continue', CapturedRef},
+                            CapturedRef
+                    after 1000 ->
+                            ?assert('false')
+                    end,
+              await_ref_owner(Ref, LeasePid),
+              ServerPid = receive
+                              {'body_cleanup_request_ready', Pid} -> Pid
+                          after 1000 ->
+                                  ?assert('false')
+                          end,
+              'ok' = sys:suspend('hackney_manager'),
+              try
+                  ServerPid ! 'send_body_cleanup_response',
+                  receive
+                      {'bounded_guardian_cleanup', 'started', GuardianPid,
+                       Ref} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  receive
+                      {'bounded_guardian_cleanup', 'failed', GuardianPid,
+                       Ref} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  receive
+                      {'body_cleanup_result', Caller, Result} ->
+                          ?assertEqual(
+                             {'error', 'transport_cleanup_timeout'}, Result)
+                  after 300 ->
+                          ?assert('false')
+                  end,
+                  ?assertMatch([_], ets:lookup('hackney_manager_refs', Ref))
+              after
+                  'ok' = sys:resume('hackney_manager')
+              end,
+              receive
+                  {'bounded_guardian_cleanup', 'complete', GuardianPid, Ref} ->
+                      'ok'
+              after 500 ->
+                      ?assert('false')
+              end,
+              ?assertEqual([], ets:lookup('hackney_manager_refs', Ref)),
+              Caller ! 'inspect_body_cleanup_mailbox',
+              receive
+                  {'body_cleanup_mailbox', Caller, Messages} ->
+                      ?assertEqual('false', has_cleanup_ack(Messages))
+              after 200 ->
+                      ?assert('false')
+              end,
+              Caller ! 'stop_body_cleanup_caller'
+      end).
+
+bounded_ref_registration_ack_timeout_compensates_without_exit_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    Parent = self(),
+    with_http_server(
+      fun(Socket, ServerParent) ->
+              ServerParent ! {'ref_ack_request_ready', self()},
+              ServerParent ! {'ref_ack_peer_close', recv_until_closed(Socket)},
+              ServerParent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'bounded_guardian_ref_ack_test_hook', Parent}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Caller = spawn(
+                         fun() ->
+                                 Result = couchbeam:db_info_bounded(
+                                            Db, {100, 1024}),
+                                 Parent ! {'ref_ack_result', self(), Result}
+                         end),
+              {GuardianPid, Ref} = receive
+                        {'bounded_guardian_ref_ack_ready', Guardian,
+                         CapturedRef, Caller} -> {Guardian, CapturedRef}
+                    after 1000 ->
+                            exit(Caller, 'kill'),
+                            ?assert('false')
+                    end,
+              receive
+                  {'ref_ack_request_ready', _ServerPid} -> 'ok'
+              after 1000 ->
+                      ?assert('false')
+              end,
+              receive
+                  {'bounded_guardian_ref_ack_timeout', GuardianPid, Ref,
+                   Caller} ->
+                      GuardianPid ! {'bounded_guardian_ref_ack_continue',
+                                     GuardianPid, Ref}
+              after 500 ->
+                      ?assert('false')
+              end,
+              receive
+                  {'bounded_guardian_ref_ack_sent', GuardianPid, Ref} ->
+                      Caller ! {
+                        'bounded_guardian_ref_ack_timeout_continue',
+                        GuardianPid, Ref}
+              after 200 ->
+                      ?assert('false')
+              end,
+              receive
+                  {'ref_ack_result', Caller, Result} ->
+                      ?assertEqual(
+                         {'error', 'transport_cleanup_timeout'}, Result)
+              after 500 ->
+                      ?assert('false')
+              end,
+              ?assertEqual([], ets:lookup('hackney_manager_refs', Ref)),
+              receive
+                  {'ref_ack_peer_close', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 500 ->
                       ?assert('false')
               end
       end).
@@ -1150,6 +1332,30 @@ owned_request_ref(WorkerPid, DeadlineMs) ->
                     ?assert('false')
             end
     end.
+
+await_ref_owner(Ref, OwnerPid) ->
+    await_ref_owner(
+      Ref, OwnerPid, erlang:monotonic_time('millisecond') + 1000).
+
+await_ref_owner(Ref, OwnerPid, DeadlineMs) ->
+    case ets:lookup('hackney_manager_refs', Ref) of
+        [{Ref, {OwnerPid, _, _}}] -> 'ok';
+        _ ->
+            case erlang:monotonic_time('millisecond') < DeadlineMs of
+                'true' ->
+                    erlang:yield(),
+                    await_ref_owner(Ref, OwnerPid, DeadlineMs);
+                'false' ->
+                    ?assert('false')
+            end
+    end.
+
+has_cleanup_ack(Messages) ->
+    lists:any(
+      fun({'bounded_guardian_cleanup_ack', _, _, _}) -> 'true';
+         ({_, 'guardian_cleanup_result', _}) -> 'true';
+         (_) -> 'false'
+      end, Messages).
 
 assert_view_transport_error_closed(Phase) ->
     {'ok', _} = application:ensure_all_started('hackney'),
