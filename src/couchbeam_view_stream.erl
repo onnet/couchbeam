@@ -224,21 +224,51 @@ decode_data(Data, #state{owner=Owner,
         end
     catch 'error':'badarg' -> exit('badarg')
     end;
-decode_data(_Data, #state{decoder='complete'}=State) ->
-    loop(State);
+decode_data(Data, #state{decoder='complete'}=State) ->
+    case only_json_whitespace(Data) of
+        'true' -> loop(State);
+        'false' -> fail_stream({'invalid_json', 'trailing_data'}, State)
+    end;
 decode_data(Data, #state{decoder=DecodeFun}=State) ->
-    try
-        {'incomplete', DecodeFun2} = DecodeFun(Data),
-        try DecodeFun2('end_stream') of 'done' ->
+    try DecodeFun(Data) of
+        {'incomplete', DecodeFun2} ->
+            bounded_decoder_state(DecodeFun2, State);
+        Unexpected ->
+            fail_stream({'malformed_view',
+                         {'unexpected_decoder_state', Unexpected}}, State)
+    catch
+        'error':'badarg' ->
+            fail_stream({'invalid_json', 'badarg'}, State);
+        Class:Reason ->
+            fail_stream({'malformed_view', {Class, Reason}}, State)
+    end.
+
+-spec bounded_decoder_state(fun((term()) -> term()), #state{}) ->
+          'ok' | no_return().
+bounded_decoder_state(DecodeFun, State) ->
+    try DecodeFun('end_stream') of
+        'done' ->
             %% JSON may finish before the HTTP body. Keep reading raw chunks so
             %% the response byte cap covers trailing bytes as well.
-            loop(State#state{decoder='complete'})
-        catch 'error':'badarg' ->
-            maybe_continue(State#state{decoder=DecodeFun2})
-        end
-    catch 'error':'badarg' ->
-            fail_stream({'invalid_json', 'badarg'}, State)
+            loop(State#state{decoder='complete'});
+        Unexpected ->
+            fail_stream({'malformed_view',
+                         {'unexpected_decoder_state', Unexpected}}, State)
+    catch
+        'error':'badarg' ->
+            maybe_continue(State#state{decoder=DecodeFun});
+        Class:Reason ->
+            fail_stream({'malformed_view', {Class, Reason}}, State)
     end.
+
+-spec only_json_whitespace(binary()) -> boolean().
+only_json_whitespace(<<>>) ->
+    'true';
+only_json_whitespace(<<Char, Rest/binary>>)
+  when Char =:= $\s; Char =:= $\t; Char =:= $\n; Char =:= $\r ->
+    only_json_whitespace(Rest);
+only_json_whitespace(_) ->
+    'false'.
 
 -spec request_options(list(),
                       'undefined' | couchbeam_httpc:request_budget()) -> list().
