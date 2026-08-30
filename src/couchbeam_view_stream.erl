@@ -100,10 +100,10 @@ do_init_stream({#db{options=Opts}, Url, Args},
         get ->
             start_view_request(get, Url, [], <<>>, FinalOpts, Budget);
         post ->
-            Body = couchbeam_ejson:encode({[{<<"keys">>,
-                                             Args#view_query_args.keys}]}),
             Headers = [{<<"Content-Type">>, <<"application/json">>}],
-            start_view_request(post, Url, Headers, Body, FinalOpts, Budget)
+            start_view_post_request(Url, Headers,
+                                    Args#view_query_args.keys,
+                                    FinalOpts, Budget)
     end,
 
     case Reply of
@@ -199,7 +199,9 @@ finish_stream(State) ->
     fail_stream({'invalid_json', 'incomplete'}, State).
 
 -spec complete_stream(#state{}) -> 'ok'.
-complete_stream(#state{owner=Owner, ref=StreamRef}=State) ->
+complete_stream(#state{owner=Owner, ref=StreamRef,
+                       client_ref=ClientRef, budget=Budget}=State) ->
+    maybe_cancel_request(ClientRef, Budget),
     ets:delete(couchbeam_view_streams, StreamRef),
     Owner ! done_message(State),
     'ok'.
@@ -369,6 +371,21 @@ start_view_request(Method, Url, Headers, Body, Options, 'undefined') ->
 start_view_request(Method, Url, Headers, Body, Options, Budget) ->
     couchbeam_httpc:request_bounded(
       Method, Url, Headers, Body, Options, Budget).
+
+-spec start_view_post_request(term(), list(), list(), list(),
+                              'undefined' |
+                              couchbeam_httpc:request_budget()) -> term().
+start_view_post_request(Url, Headers, Keys, Options, 'undefined') ->
+    Body = couchbeam_ejson:encode({[{<<"keys">>, Keys}]}),
+    couchbeam_httpc:request(post, Url, Headers, Body, Options);
+start_view_post_request(Url, Headers, Keys, Options, Budget) ->
+    case couchbeam_httpc:bounded_encode_json(
+           {[{<<"keys">>, Keys}]}, Budget, Options) of
+        {'ok', Body} ->
+            start_view_request(post, Url, Headers, Body, Options, Budget);
+        {'error', _}=Error ->
+            Error
+    end.
 
 -spec decoder_owner(#state{}) -> pid().
 decoder_owner(#state{owner=Owner, budget='undefined'}) ->

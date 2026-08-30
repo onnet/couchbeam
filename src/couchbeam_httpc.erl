@@ -9,6 +9,7 @@
          db_request/5, db_request/6,
          json_body/1,
          bounded_json_body/2,
+         bounded_encode_json/2, bounded_encode_json/3,
          new_request_budget/1,
          cancel_request/1,
          db_resp/2,
@@ -28,6 +29,7 @@
 
 -type request_budget_spec() :: {pos_integer(), pos_integer()}.
 -type request_budget() :: #{'deadline_ms' := integer(),
+                            'timeout_ms' := pos_integer(),
                             'max_response_bytes' := pos_integer()}.
 
 request(Method, Url, Headers, Body, Options) ->
@@ -63,6 +65,7 @@ new_request_budget({TimeoutMs, MaxResponseBytes})
   when is_integer(TimeoutMs), TimeoutMs > 0,
        is_integer(MaxResponseBytes), MaxResponseBytes > 0 ->
     {'ok', #{'deadline_ms' => erlang:monotonic_time('millisecond') + TimeoutMs,
+             'timeout_ms' => TimeoutMs,
              'max_response_bytes' => MaxResponseBytes}};
 new_request_budget(_) ->
     {'error', 'invalid_request_budget'}.
@@ -80,6 +83,60 @@ bounded_json_body(Ref, #{'deadline_ms' := _,
 bounded_json_body(Ref, _) ->
     close_request(Ref),
     {'error', 'invalid_request_budget'}.
+
+-spec bounded_encode_json(term(), request_budget()) ->
+          {'ok', binary()} | {'error', 'timeout' | term()}.
+bounded_encode_json(Term, Budget) ->
+    bounded_encode_json(Term, Budget, []).
+
+-spec bounded_encode_json(term(), request_budget(), list()) ->
+          {'ok', binary()} | {'error', 'timeout' | term()}.
+bounded_encode_json(Term, Budget, Options) ->
+    Delay = encode_test_delay(Options),
+    run_bounded_worker(
+      fun() ->
+              maybe_delay_encode(Delay),
+              couchbeam_ejson:encode(Term)
+      end,
+      fun(Encoded) when is_binary(Encoded) -> {'ok', Encoded};
+         (Unexpected) -> {'error', {'invalid_json_encoding', Unexpected}}
+      end,
+      Budget).
+
+-spec run_bounded_worker(fun(() -> term()), fun((term()) -> term()),
+                         request_budget()) -> term().
+run_bounded_worker(WorkFun, ResultFun, Budget) ->
+    Parent = self(),
+    Token = make_ref(),
+    {WorkerPid, MonitorRef} = spawn_monitor(
+                                fun() -> Parent ! {Token, WorkFun()} end),
+    guard_request_worker(Parent, WorkerPid),
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Token, Result} ->
+                    erlang:demonitor(MonitorRef, ['flush']),
+                    case budget_status(Budget) of
+                        'ok' -> ResultFun(Result);
+                        {'error', 'timeout'} -> {'error', 'timeout'}
+                    end;
+                {'DOWN', MonitorRef, 'process', WorkerPid, Reason} ->
+                    flush_request_result(Token),
+                    {'error', {'json_encoding_failed', Reason}}
+            after TimeoutMs ->
+                    exit(WorkerPid, 'kill'),
+                    _ = await_worker_down(
+                          WorkerPid, MonitorRef, cleanup_deadline(Budget)),
+                    flush_request_result(Token),
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            exit(WorkerPid, 'kill'),
+            _ = await_worker_down(
+                  WorkerPid, MonitorRef, cleanup_deadline(Budget)),
+            flush_request_result(Token),
+            {'error', 'timeout'}
+    end.
 
 -spec cancel_request(reference()) -> 'ok'.
 cancel_request(Ref) ->
@@ -152,6 +209,7 @@ bounded_body_control(Unexpected, Ref, _Budget, _Acc, _Bytes) ->
 bounded_body_done(Ref, Budget, Acc, Bytes) ->
     case remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
+            close_request(Ref),
             {'ok', iolist_to_binary(lists:reverse(Acc)), Bytes};
         _ ->
             close_request(Ref),
@@ -241,9 +299,13 @@ bounded_request(Method, Url, Headers, Body, Options, Budget) ->
 request_bounded(Method, Url, Headers, Body, Options, Budget) ->
     Parent = self(),
     Token = make_ref(),
+    LeasePid = spawn(fun transport_lease/0),
+    HandoffHook = handoff_test_hook(Options),
+    UploadHook = upload_test_hook(Options),
     RequestOptions = [{'async', 'once'}, {'stream_to', Parent}
                       | proplists:delete(
-                          'async', proplists:delete('stream_to', Options))],
+                          'async', proplists:delete(
+                                     'stream_to', strip_test_options(Options)))],
     {WorkerPid, MonitorRef} = spawn_monitor(
                                 fun() ->
                                         Result = request(Method, Url, Headers,
@@ -253,8 +315,17 @@ request_bounded(Method, Url, Headers, Body, Options, Budget) ->
                                             {Token, 'release'} -> 'ok'
                                         end
                                 end),
+    notify_upload_worker(UploadHook, WorkerPid),
     guard_request_worker(Parent, WorkerPid),
-    await_bounded_request(Token, WorkerPid, MonitorRef, Budget).
+    guard_transport_lease(Parent, LeasePid),
+    await_bounded_request(Token, WorkerPid, MonitorRef, LeasePid,
+                          HandoffHook, Budget).
+
+-spec transport_lease() -> no_return().
+transport_lease() ->
+    receive
+        'stop' -> exit('normal')
+    end.
 
 -spec guard_request_worker(pid(), pid()) -> 'ok'.
 guard_request_worker(Parent, WorkerPid) ->
@@ -270,38 +341,77 @@ guard_request_worker(Parent, WorkerPid) ->
               end),
     'ok'.
 
--spec await_bounded_request(reference(), pid(), reference(), request_budget()) ->
+-spec guard_transport_lease(pid(), pid()) -> 'ok'.
+guard_transport_lease(Parent, LeasePid) ->
+    _ = spawn(fun() ->
+                      ParentRef = erlang:monitor('process', Parent),
+                      LeaseRef = erlang:monitor('process', LeasePid),
+                      receive
+                          {'DOWN', ParentRef, 'process', Parent, _Reason} ->
+                              exit(LeasePid, 'kill');
+                          {'DOWN', LeaseRef, 'process', LeasePid, _Reason} ->
+                              'ok'
+                      end
+              end),
+    'ok'.
+
+-spec await_bounded_request(reference(), pid(), reference(), pid(), term(),
+                            request_budget()) ->
           {'ok', reference()} | {'error', term()}.
-await_bounded_request(Token, WorkerPid, MonitorRef, Budget) ->
+await_bounded_request(Token, WorkerPid, MonitorRef, LeasePid, HandoffHook,
+                      Budget) ->
     case remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
             receive
                 {Token, {'ok', Ref}} when is_reference(Ref) ->
                     adopt_bounded_request(
-                      Token, WorkerPid, MonitorRef, Ref, Budget);
+                      Token, WorkerPid, MonitorRef, LeasePid, Ref,
+                      HandoffHook, Budget);
                 {Token, {'error', _}=Error} ->
-                    release_request_worker(Token, WorkerPid, MonitorRef),
+                    exit(LeasePid, 'kill'),
+                    release_request_worker(Token, WorkerPid, MonitorRef,
+                                           Budget),
                     Error;
                 {Token, Unexpected} ->
-                    release_request_worker(Token, WorkerPid, MonitorRef),
+                    exit(LeasePid, 'kill'),
+                    release_request_worker(Token, WorkerPid, MonitorRef,
+                                           Budget),
                     {'error', {'unexpected_request_result', Unexpected}};
                 {'DOWN', MonitorRef, 'process', WorkerPid, Reason} ->
+                    exit(LeasePid, 'kill'),
                     flush_request_result(Token),
-                    await_owned_transport_cleanup(WorkerPid),
+                    require_owner_cleanup(WorkerPid, Budget),
                     {'error', {'request_worker_down', Reason}}
             after TimeoutMs ->
-                    abort_request_worker(Token, WorkerPid, MonitorRef),
+                    exit(LeasePid, 'kill'),
+                    abort_request_worker(Token, WorkerPid, MonitorRef, Budget),
                     {'error', 'timeout'}
             end;
         _ ->
-            abort_request_worker(Token, WorkerPid, MonitorRef),
+            exit(LeasePid, 'kill'),
+            abort_request_worker(Token, WorkerPid, MonitorRef, Budget),
             {'error', 'timeout'}
     end.
 
--spec adopt_bounded_request(reference(), pid(), reference(), reference(),
-                            request_budget()) ->
+-spec adopt_bounded_request(reference(), pid(), reference(), pid(), reference(),
+                            term(), request_budget()) ->
           {'ok', reference()} | {'error', term()}.
-adopt_bounded_request(Token, WorkerPid, MonitorRef, Ref, Budget) ->
+adopt_bounded_request(Token, WorkerPid, MonitorRef, LeasePid, Ref,
+                      HandoffHook, Budget) ->
+    case before_handoff(HandoffHook, Ref, Budget) of
+        'ok' -> adopt_bounded_request_now(
+                  Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget);
+        {'error', 'timeout'} ->
+            cleanup_failed_handoff(
+              Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget),
+            {'error', 'timeout'}
+    end.
+
+-spec adopt_bounded_request_now(reference(), pid(), reference(), pid(),
+                                reference(), request_budget()) ->
+          {'ok', reference()} | {'error', term()}.
+adopt_bounded_request_now(Token, WorkerPid, MonitorRef, LeasePid, Ref,
+                          Budget) ->
     case remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
             %% Hackney 1.6 transfers the socket to its async stream process,
@@ -310,7 +420,7 @@ adopt_bounded_request(Token, WorkerPid, MonitorRef, Ref, Budget) ->
             OwnershipResult = try
                                   gen_server:call(
                                     'hackney_manager',
-                                    {'controlling_process', Ref, self()},
+                                    {'controlling_process', Ref, LeasePid},
                                     TimeoutMs)
                               catch
                                   'exit':{'timeout', _} ->
@@ -320,7 +430,9 @@ adopt_bounded_request(Token, WorkerPid, MonitorRef, Ref, Budget) ->
                               end,
             case OwnershipResult of
                 'ok' ->
-                    release_request_worker(Token, WorkerPid, MonitorRef),
+                    remember_owned_request(Ref, LeasePid, Budget),
+                    release_request_worker(Token, WorkerPid, MonitorRef,
+                                           Budget),
                     case budget_status(Budget) of
                         'ok' -> {'ok', Ref};
                         {'error', 'timeout'} ->
@@ -328,33 +440,108 @@ adopt_bounded_request(Token, WorkerPid, MonitorRef, Ref, Budget) ->
                             {'error', 'timeout'}
                     end;
                 {'error', 'timeout'} ->
-                    abort_request_worker(Token, WorkerPid, MonitorRef),
+                    cleanup_failed_handoff(
+                      Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget),
                     {'error', 'timeout'};
                 OwnershipError ->
-                    abort_request_worker(Token, WorkerPid, MonitorRef),
+                    cleanup_failed_handoff(
+                      Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget),
                     {'error', {'request_ownership', OwnershipError}}
             end;
         _ ->
-            abort_request_worker(Token, WorkerPid, MonitorRef),
+            cleanup_failed_handoff(
+              Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget),
             {'error', 'timeout'}
     end.
 
--spec release_request_worker(reference(), pid(), reference()) -> 'ok'.
-release_request_worker(Token, WorkerPid, MonitorRef) ->
-    WorkerPid ! {Token, 'release'},
-    receive
-        {'DOWN', MonitorRef, 'process', WorkerPid, _Reason} -> 'ok'
-    end,
-    await_owned_transport_cleanup(WorkerPid).
+-spec cleanup_failed_handoff(reference(), pid(), reference(), pid(),
+                             reference(), request_budget()) -> 'ok'.
+cleanup_failed_handoff(Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget) ->
+    exit(LeasePid, 'kill'),
+    stop_request_worker(Token, WorkerPid, MonitorRef, Budget),
+    CleanupBudget = cleanup_deadline(Budget),
+    require_ownership_barrier(Ref, LeasePid, CleanupBudget),
+    require_request_cleanup(Ref, CleanupBudget),
+    flush_response_messages(Ref).
 
--spec abort_request_worker(reference(), pid(), reference()) -> 'ok'.
-abort_request_worker(Token, WorkerPid, MonitorRef) ->
+-spec require_ownership_barrier(reference(), pid(), request_budget()) -> 'ok'.
+require_ownership_barrier(Ref, LeasePid, Budget) ->
+    case ownership_barrier(Ref, LeasePid, Budget) of
+        {'error', 'timeout'} -> exit({'transport_cleanup_timeout', Ref});
+        _ -> 'ok'
+    end.
+
+-spec ownership_barrier(reference(), pid(), request_budget()) -> term().
+ownership_barrier(Ref, LeasePid, Budget) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            try gen_server:call(
+                  'hackney_manager',
+                  {'controlling_process', Ref, LeasePid}, TimeoutMs)
+            catch
+                'exit':{'timeout', _} -> {'error', 'timeout'};
+                Class:Reason -> {'error', {Class, Reason}}
+            end;
+        _ ->
+            {'error', 'timeout'}
+    end.
+
+-spec release_request_worker(reference(), pid(), reference(),
+                             request_budget()) -> 'ok'.
+release_request_worker(Token, WorkerPid, MonitorRef, Budget) ->
+    WorkerPid ! {Token, 'release'},
+    require_worker_down(WorkerPid, MonitorRef, Budget),
+    require_owner_cleanup(WorkerPid, Budget),
+    'ok'.
+
+-spec abort_request_worker(reference(), pid(), reference(), request_budget()) ->
+          'ok'.
+abort_request_worker(Token, WorkerPid, MonitorRef, Budget) ->
+    stop_request_worker(Token, WorkerPid, MonitorRef, Budget),
+    require_owner_cleanup(WorkerPid, Budget),
+    'ok'.
+
+-spec stop_request_worker(reference(), pid(), reference(), request_budget()) ->
+          'ok'.
+stop_request_worker(Token, WorkerPid, MonitorRef, Budget) ->
     exit(WorkerPid, 'kill'),
-    receive
-        {'DOWN', MonitorRef, 'process', WorkerPid, _Reason} -> 'ok'
-    end,
+    require_worker_down(WorkerPid, MonitorRef, Budget),
     flush_request_result(Token),
-    await_owned_transport_cleanup(WorkerPid).
+    'ok'.
+
+-spec require_worker_down(pid(), reference(), request_budget()) -> 'ok'.
+require_worker_down(WorkerPid, MonitorRef, Budget) ->
+    case await_worker_down(
+           WorkerPid, MonitorRef, cleanup_deadline(Budget)) of
+        'ok' -> 'ok';
+        {'error', 'timeout'} ->
+            exit({'transport_cleanup_timeout', WorkerPid})
+    end.
+
+-spec require_owner_cleanup(pid(), request_budget()) -> 'ok'.
+require_owner_cleanup(WorkerPid, Budget) ->
+    case await_owned_transport_cleanup(
+           WorkerPid, cleanup_deadline(Budget)) of
+        'ok' -> 'ok';
+        {'error', 'timeout'} ->
+            exit({'transport_cleanup_timeout', WorkerPid})
+    end.
+
+-spec await_worker_down(pid(), reference(), request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+await_worker_down(WorkerPid, MonitorRef, Budget) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'DOWN', MonitorRef, 'process', WorkerPid, _Reason} -> 'ok'
+            after TimeoutMs ->
+                    erlang:demonitor(MonitorRef, ['flush']),
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            erlang:demonitor(MonitorRef, ['flush']),
+            {'error', 'timeout'}
+    end.
 
 -spec flush_request_result(reference()) -> 'ok'.
 flush_request_result(Token) ->
@@ -364,8 +551,9 @@ flush_request_result(Token) ->
             'ok'
     end.
 
--spec await_owned_transport_cleanup(pid()) -> 'ok'.
-await_owned_transport_cleanup(OwnerPid) ->
+-spec await_owned_transport_cleanup(pid(), request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+await_owned_transport_cleanup(OwnerPid, Budget) ->
     case catch ets:match_object(
                  'hackney_manager_refs', {'_', {OwnerPid, '_', '_'}}) of
         [] ->
@@ -373,8 +561,123 @@ await_owned_transport_cleanup(OwnerPid) ->
         {'EXIT', {'badarg', _}} ->
             'ok';
         [_ | _] ->
-            erlang:yield(),
-            await_owned_transport_cleanup(OwnerPid)
+            case remaining_timeout(Budget) of
+                Remaining when Remaining > 0 ->
+                    erlang:yield(),
+                    await_owned_transport_cleanup(OwnerPid, Budget);
+                _ ->
+                    {'error', 'timeout'}
+            end
+    end.
+
+-spec await_request_cleanup(reference(), request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+await_request_cleanup(Ref, Budget) ->
+    case catch ets:lookup('hackney_manager_refs', Ref) of
+        [] -> 'ok';
+        {'EXIT', {'badarg', _}} -> 'ok';
+        [_] ->
+            case remaining_timeout(Budget) of
+                Remaining when Remaining > 0 ->
+                    erlang:yield(),
+                    await_request_cleanup(Ref, Budget);
+                _ -> {'error', 'timeout'}
+            end
+    end.
+
+-spec require_request_cleanup(reference(), request_budget()) -> 'ok'.
+require_request_cleanup(Ref, Budget) ->
+    case await_request_cleanup(Ref, Budget) of
+        'ok' -> 'ok';
+        {'error', 'timeout'} -> exit({'transport_cleanup_timeout', Ref})
+    end.
+
+-spec cleanup_deadline(request_budget()) -> request_budget().
+cleanup_deadline(#{'timeout_ms' := TimeoutMs}=Budget) ->
+    Budget#{'deadline_ms' =>
+                erlang:monotonic_time('millisecond') + TimeoutMs}.
+
+-spec remember_owned_request(reference(), pid(), request_budget()) -> term().
+remember_owned_request(Ref, LeasePid, Budget) ->
+    put({'bounded_request_owner', Ref}, {LeasePid, Budget}).
+
+-spec flush_response_messages(reference()) -> 'ok'.
+flush_response_messages(Ref) ->
+    receive
+        {'hackney_response', Ref, _} -> flush_response_messages(Ref)
+    after 0 ->
+            'ok'
+    end.
+
+-ifdef(TEST).
+-spec handoff_test_hook(list()) -> 'undefined' | pid().
+handoff_test_hook(Options) ->
+    proplists:get_value('bounded_handoff_test_hook', Options, 'undefined').
+
+-spec upload_test_hook(list()) -> 'undefined' | pid().
+upload_test_hook(Options) ->
+    proplists:get_value('bounded_upload_test_hook', Options, 'undefined').
+
+-spec encode_test_delay(list()) -> non_neg_integer().
+encode_test_delay(Options) ->
+    case proplists:get_value('bounded_encode_test_delay_ms', Options, 0) of
+        Delay when is_integer(Delay), Delay >= 0 -> Delay;
+        _ -> 0
+    end.
+
+-spec strip_test_options(list()) -> list().
+strip_test_options(Options) ->
+    proplists:delete(
+      'bounded_handoff_test_hook',
+      proplists:delete(
+        'bounded_upload_test_hook',
+        proplists:delete('bounded_encode_test_delay_ms', Options))).
+-else.
+-spec handoff_test_hook(list()) -> 'undefined'.
+handoff_test_hook(_Options) ->
+    'undefined'.
+
+-spec upload_test_hook(list()) -> 'undefined'.
+upload_test_hook(_Options) ->
+    'undefined'.
+
+-spec encode_test_delay(list()) -> 0.
+encode_test_delay(_Options) ->
+    0.
+
+-spec strip_test_options(list()) -> list().
+strip_test_options(Options) ->
+    Options.
+-endif.
+
+-spec notify_upload_worker('undefined' | pid(), pid()) -> 'ok'.
+notify_upload_worker('undefined', _WorkerPid) ->
+    'ok';
+notify_upload_worker(HookPid, WorkerPid) ->
+    HookPid ! {'bounded_upload_worker', WorkerPid},
+    'ok'.
+
+-spec maybe_delay_encode(non_neg_integer()) -> 'ok'.
+maybe_delay_encode(0) ->
+    'ok';
+maybe_delay_encode(Delay) ->
+    timer:sleep(Delay).
+
+-spec before_handoff('undefined' | pid(), reference(), request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+before_handoff('undefined', _Ref, _Budget) ->
+    'ok';
+before_handoff(HookPid, Ref, Budget) ->
+    HookPid ! {'bounded_handoff_ready', Ref, self()},
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'bounded_handoff_continue', Ref} -> 'ok'
+            after TimeoutMs ->
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            {'error', 'timeout'}
     end.
 
 -spec budget_status(request_budget()) -> 'ok' | {'error', 'timeout'}.
@@ -460,14 +763,24 @@ remaining_timeout(#{'deadline_ms' := DeadlineMs}) ->
 
 -spec close_request(reference()) -> 'ok'.
 close_request(Ref) ->
+    case erase({'bounded_request_owner', Ref}) of
+        {LeasePid, Budget} ->
+            exit(LeasePid, 'kill'),
+            require_request_cleanup(Ref, cleanup_deadline(Budget)),
+            flush_response_messages(Ref);
+        'undefined' ->
+            close_unowned_request(Ref)
+    end,
+    'ok'.
+
+-spec close_unowned_request(reference()) -> 'ok'.
+close_unowned_request(Ref) ->
     case catch hackney:cancel_request(Ref) of
         {'ok', {Transport, Socket, _Buffer, _ResponseState}}
           when Socket =/= 'nil' ->
-            _ = catch Transport:close(Socket),
-            'ok';
+            _ = catch Transport:close(Socket);
         _ ->
-            _ = catch hackney:close(Ref),
-            'ok'
+            _ = catch hackney:close(Ref)
     end,
     'ok'.
 
