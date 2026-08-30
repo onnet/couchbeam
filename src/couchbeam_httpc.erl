@@ -5,7 +5,7 @@
 
 -module(couchbeam_httpc).
 
--export([request/5,
+-export([request/5, request_bounded/6,
          db_request/5, db_request/6,
          json_body/1,
          bounded_json_body/2,
@@ -231,10 +231,157 @@ flush_decode_result(Token) ->
 -spec bounded_request(term(), term(), list(), term(), list(),
                       request_budget()) -> term().
 bounded_request(Method, Url, Headers, Body, Options, Budget) ->
-    case request(Method, Url, Headers, Body,
-                 [{'async', 'once'} | Options]) of
+    case request_bounded(Method, Url, Headers, Body, Options, Budget) of
         {'ok', Ref} -> bounded_response_status(Ref, Budget);
         Error -> Error
+    end.
+
+-spec request_bounded(term(), term(), list(), term(), list(), request_budget()) ->
+          {'ok', reference()} | {'error', term()}.
+request_bounded(Method, Url, Headers, Body, Options, Budget) ->
+    Parent = self(),
+    Token = make_ref(),
+    RequestOptions = [{'async', 'once'}, {'stream_to', Parent}
+                      | proplists:delete(
+                          'async', proplists:delete('stream_to', Options))],
+    {WorkerPid, MonitorRef} = spawn_monitor(
+                                fun() ->
+                                        Result = request(Method, Url, Headers,
+                                                         Body, RequestOptions),
+                                        Parent ! {Token, Result},
+                                        receive
+                                            {Token, 'release'} -> 'ok'
+                                        end
+                                end),
+    guard_request_worker(Parent, WorkerPid),
+    await_bounded_request(Token, WorkerPid, MonitorRef, Budget).
+
+-spec guard_request_worker(pid(), pid()) -> 'ok'.
+guard_request_worker(Parent, WorkerPid) ->
+    _ = spawn(fun() ->
+                      ParentRef = erlang:monitor('process', Parent),
+                      WorkerRef = erlang:monitor('process', WorkerPid),
+                      receive
+                          {'DOWN', ParentRef, 'process', Parent, _Reason} ->
+                              exit(WorkerPid, 'kill');
+                          {'DOWN', WorkerRef, 'process', WorkerPid, _Reason} ->
+                              'ok'
+                      end
+              end),
+    'ok'.
+
+-spec await_bounded_request(reference(), pid(), reference(), request_budget()) ->
+          {'ok', reference()} | {'error', term()}.
+await_bounded_request(Token, WorkerPid, MonitorRef, Budget) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Token, {'ok', Ref}} when is_reference(Ref) ->
+                    adopt_bounded_request(
+                      Token, WorkerPid, MonitorRef, Ref, Budget);
+                {Token, {'error', _}=Error} ->
+                    release_request_worker(Token, WorkerPid, MonitorRef),
+                    Error;
+                {Token, Unexpected} ->
+                    release_request_worker(Token, WorkerPid, MonitorRef),
+                    {'error', {'unexpected_request_result', Unexpected}};
+                {'DOWN', MonitorRef, 'process', WorkerPid, Reason} ->
+                    flush_request_result(Token),
+                    await_owned_transport_cleanup(WorkerPid),
+                    {'error', {'request_worker_down', Reason}}
+            after TimeoutMs ->
+                    abort_request_worker(Token, WorkerPid, MonitorRef),
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            abort_request_worker(Token, WorkerPid, MonitorRef),
+            {'error', 'timeout'}
+    end.
+
+-spec adopt_bounded_request(reference(), pid(), reference(), reference(),
+                            request_budget()) ->
+          {'ok', reference()} | {'error', term()}.
+adopt_bounded_request(Token, WorkerPid, MonitorRef, Ref, Budget) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            %% Hackney 1.6 transfers the socket to its async stream process,
+            %% while the manager continues to track the request owner. Change
+            %% that tracked owner before the temporary upload owner exits.
+            OwnershipResult = try
+                                  gen_server:call(
+                                    'hackney_manager',
+                                    {'controlling_process', Ref, self()},
+                                    TimeoutMs)
+                              catch
+                                  'exit':{'timeout', _} ->
+                                      {'error', 'timeout'};
+                                  Class:Reason ->
+                                      {'error', {Class, Reason}}
+                              end,
+            case OwnershipResult of
+                'ok' ->
+                    release_request_worker(Token, WorkerPid, MonitorRef),
+                    case budget_status(Budget) of
+                        'ok' -> {'ok', Ref};
+                        {'error', 'timeout'} ->
+                            close_request(Ref),
+                            {'error', 'timeout'}
+                    end;
+                {'error', 'timeout'} ->
+                    abort_request_worker(Token, WorkerPid, MonitorRef),
+                    {'error', 'timeout'};
+                OwnershipError ->
+                    abort_request_worker(Token, WorkerPid, MonitorRef),
+                    {'error', {'request_ownership', OwnershipError}}
+            end;
+        _ ->
+            abort_request_worker(Token, WorkerPid, MonitorRef),
+            {'error', 'timeout'}
+    end.
+
+-spec release_request_worker(reference(), pid(), reference()) -> 'ok'.
+release_request_worker(Token, WorkerPid, MonitorRef) ->
+    WorkerPid ! {Token, 'release'},
+    receive
+        {'DOWN', MonitorRef, 'process', WorkerPid, _Reason} -> 'ok'
+    end,
+    await_owned_transport_cleanup(WorkerPid).
+
+-spec abort_request_worker(reference(), pid(), reference()) -> 'ok'.
+abort_request_worker(Token, WorkerPid, MonitorRef) ->
+    exit(WorkerPid, 'kill'),
+    receive
+        {'DOWN', MonitorRef, 'process', WorkerPid, _Reason} -> 'ok'
+    end,
+    flush_request_result(Token),
+    await_owned_transport_cleanup(WorkerPid).
+
+-spec flush_request_result(reference()) -> 'ok'.
+flush_request_result(Token) ->
+    receive
+        {Token, _} -> flush_request_result(Token)
+    after 0 ->
+            'ok'
+    end.
+
+-spec await_owned_transport_cleanup(pid()) -> 'ok'.
+await_owned_transport_cleanup(OwnerPid) ->
+    case catch ets:match_object(
+                 'hackney_manager_refs', {'_', {OwnerPid, '_', '_'}}) of
+        [] ->
+            'ok';
+        {'EXIT', {'badarg', _}} ->
+            'ok';
+        [_ | _] ->
+            erlang:yield(),
+            await_owned_transport_cleanup(OwnerPid)
+    end.
+
+-spec budget_status(request_budget()) -> 'ok' | {'error', 'timeout'}.
+budget_status(Budget) ->
+    case remaining_timeout(Budget) of
+        Remaining when Remaining > 0 -> 'ok';
+        _ -> {'error', 'timeout'}
     end.
 
 -spec bounded_response_status(reference(), request_budget()) -> term().

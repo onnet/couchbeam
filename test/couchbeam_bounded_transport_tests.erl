@@ -474,6 +474,116 @@ send_slow_header_bytes(Socket, Count, DelayMs) ->
         {'error', _}=Error -> Error
     end.
 
+bounded_save_doc_cancels_stalled_upload_test() ->
+    Payload = binary:copy(<<"x">>, 1024 * 1024),
+    assert_stalled_upload_deadline(
+      fun(Db) ->
+              couchbeam:save_doc_bounded(
+                Db,
+                {[{<<"_id">>, <<"doc">>}, {<<"payload">>, Payload}]},
+                [], {50, 1024})
+      end).
+
+bounded_view_post_cancels_stalled_upload_test() ->
+    Key = binary:copy(<<"k">>, 1024 * 1024),
+    assert_stalled_upload_deadline(
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(
+                Db, 'all_docs', [{'keys', [Key]}], {50, 1024})
+      end).
+
+bounded_view_decode_watchdog_cancels_transport_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    ensure_couchbeam_supervisor(),
+    Body = <<"{\"total_rows\":0,\"offset\":0,\"rows\":[]}">>,
+    with_http_server(
+      fun(Socket, Parent) ->
+              send_json_headers(Socket, byte_size(Body)),
+              'ok' = gen_tcp:send(Socket, Body),
+              Parent ! {'peer_close_result', recv_until_closed(Socket)},
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl, [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Started = erlang:monotonic_time('millisecond'),
+              ?assertEqual(
+                 {'error', 'timeout'},
+                 couchbeam_view:fetch_bounded(
+                   Db, 'all_docs',
+                   [{'bounded_decode_test_delay_ms', 200}], {50, 1024})),
+              Elapsed = erlang:monotonic_time('millisecond') - Started,
+              ?assert(Elapsed < 150),
+              receive
+                  {'peer_close_result', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 1500 ->
+                  ?assert('false')
+              end
+      end).
+
+bounded_view_status_transport_error_closes_peer_test() ->
+    assert_view_transport_error_closed('status').
+
+bounded_view_body_transport_error_closes_peer_test() ->
+    assert_view_transport_error_closed('body').
+
+assert_stalled_upload_deadline(CallFun) ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    with_http_server(
+      fun(Socket, Parent) ->
+              timer:sleep(200),
+              Parent ! {'peer_close_result', recv_until_closed(Socket)},
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl, [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Started = erlang:monotonic_time('millisecond'),
+              ?assertEqual({'error', 'timeout'}, CallFun(Db)),
+              Elapsed = erlang:monotonic_time('millisecond') - Started,
+              ?assert(Elapsed < 150),
+              receive
+                  {'peer_close_result', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 1500 ->
+                  ?assert('false')
+              end
+      end).
+
+assert_view_transport_error_closed(Phase) ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    ensure_couchbeam_supervisor(),
+    with_http_server(
+      fun(Socket, Parent) ->
+              maybe_send_transport_error_headers(Socket, Phase),
+              'ok' = gen_tcp:shutdown(Socket, 'write'),
+              Parent ! {'peer_close_result', recv_until_closed(Socket)},
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl, [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              ?assertMatch(
+                 {'error', _},
+                 couchbeam_view:fetch_bounded(
+                   Db, 'all_docs', [], {1000, 1024})),
+              receive
+                  {'peer_close_result', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 1500 ->
+                  ?assert('false')
+              end
+      end).
+
+maybe_send_transport_error_headers(_Socket, 'status') ->
+    'ok';
+maybe_send_transport_error_headers(Socket, 'body') ->
+    send_json_headers(Socket, 32).
+
 with_http_server(ServerFun, ClientFun) ->
     {'ok', ListenSocket} = gen_tcp:listen(
                              0,

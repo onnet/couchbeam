@@ -34,7 +34,8 @@
                 decoder,
                 async='normal',
                 budget='undefined',
-                response_bytes=0}).
+                response_bytes=0,
+                decode_test_delay_ms=0}).
 
 -record(viewst, {parent,
                  owner,
@@ -74,7 +75,8 @@ init_stream(Parent, Owner, StreamRef, {_Db, _Url, _Args}=Req,
                        ref=StreamRef,
                        mref=MRef,
                        async=Async,
-                       budget=Budget},
+                       budget=Budget,
+                       decode_test_delay_ms=decode_test_delay(StreamOptions)},
 
     %% connect to the view
     case do_init_stream(Req, InitState) of
@@ -96,12 +98,12 @@ do_init_stream({#db{options=Opts}, Url, Args},
     FinalOpts = request_options([{'async', 'once'} | Opts], Budget),
     Reply = case Args#view_query_args.method of
         get ->
-            couchbeam_httpc:request(get, Url, [], <<>>, FinalOpts);
+            start_view_request(get, Url, [], <<>>, FinalOpts, Budget);
         post ->
             Body = couchbeam_ejson:encode({[{<<"keys">>,
                                              Args#view_query_args.keys}]}),
             Headers = [{<<"Content-Type">>, <<"application/json">>}],
-            couchbeam_httpc:request(post, Url, Headers, Body, FinalOpts)
+            start_view_request(post, Url, Headers, Body, FinalOpts, Budget)
     end,
 
     case Reply of
@@ -116,11 +118,11 @@ do_init_stream({#db{options=Opts}, Url, Args},
                     {'error', 'timeout'};
                 {hackney_response, Ref, {status, 200, _}} ->
                     #state{parent=Parent,
-                           owner=Owner,
                            ref=StreamRef,
                            async=Async} = State,
 
-                    DecoderFun = jsx:decoder(?MODULE, [Parent, Owner,
+                    DecoderOwner = decoder_owner(State),
+                    DecoderFun = jsx:decoder(?MODULE, [Parent, DecoderOwner,
                                                        StreamRef, MRef, Ref,
                                                        Async, Budget], [stream]),
                     {ok, State#state{client_ref=Ref,
@@ -133,6 +135,7 @@ do_init_stream({#db{options=Opts}, Url, Args},
                     maybe_cancel_request(Ref, Budget),
                     {error, {http_error, Status, Reason}};
                 {hackney_response, Ref, {error, Reason}} ->
+                    maybe_cancel_request(Ref, Budget),
                     {error, Reason}
             after Timeout ->
                     maybe_cancel_request(Ref, Budget),
@@ -159,7 +162,7 @@ loop(#state{owner=Owner,
 
 -spec loop_receive(#state{}, pid(), reference(), reference(), reference()) ->
           'ok' | no_return().
-loop_receive(State, Owner, StreamRef, MRef, ClientRef) ->
+loop_receive(State, _Owner, StreamRef, MRef, ClientRef) ->
     hackney:stream_next(ClientRef),
     Timeout = receive_timeout(State),
     receive
@@ -179,10 +182,7 @@ loop_receive(State, Owner, StreamRef, MRef, ClientRef) ->
                 {'error', Reason} -> fail_stream(Reason, State)
             end;
         {hackney_response, ClientRef, Error} ->
-            ets:delete(couchbeam_view_streams, StreamRef),
-            %% report the error
-            report_error(Error, StreamRef, Owner),
-            exit(Error)
+            fail_or_report_stream(Error, State)
     after Timeout ->
             fail_stream('timeout', State)
     end.
@@ -224,41 +224,132 @@ decode_data(Data, #state{owner=Owner,
         end
     catch 'error':'badarg' -> exit('badarg')
     end;
-decode_data(Data, #state{decoder='complete'}=State) ->
+decode_data(Data, #state{}=State) ->
+    decode_data_bounded(Data, State).
+
+-spec decode_data_bounded(binary(), #state{}) -> 'ok' | no_return().
+decode_data_bounded(Data, #state{decoder=Decoder,
+                                 decode_test_delay_ms=Delay}=State) ->
+    Parent = self(),
+    Token = make_ref(),
+    {DecoderPid, MonitorRef} = spawn_monitor(
+                                 fun() ->
+                                         maybe_delay_decode(Delay),
+                                         Parent ! {Token,
+                                                   bounded_decode_result(
+                                                     Data, Decoder)}
+                                 end),
+    await_bounded_decode(Token, DecoderPid, MonitorRef, State).
+
+-spec bounded_decode_result(binary(), 'complete' | fun((term()) -> term())) ->
+          {'ok', 'complete' | fun((term()) -> term())} | {'error', term()}.
+bounded_decode_result(Data, 'complete') ->
     case only_json_whitespace(Data) of
-        'true' -> loop(State);
-        'false' -> fail_stream({'invalid_json', 'trailing_data'}, State)
+        'true' -> {'ok', 'complete'};
+        'false' -> {'error', {'invalid_json', 'trailing_data'}}
     end;
-decode_data(Data, #state{decoder=DecodeFun}=State) ->
+bounded_decode_result(Data, DecodeFun) ->
     try DecodeFun(Data) of
         {'incomplete', DecodeFun2} ->
-            bounded_decoder_state(DecodeFun2, State);
+            bounded_decoder_result(DecodeFun2);
         Unexpected ->
-            fail_stream({'malformed_view',
-                         {'unexpected_decoder_state', Unexpected}}, State)
+            {'error', {'malformed_view',
+                       {'unexpected_decoder_state', Unexpected}}}
     catch
         'error':'badarg' ->
-            fail_stream({'invalid_json', 'badarg'}, State);
+            {'error', {'invalid_json', 'badarg'}};
         Class:Reason ->
-            fail_stream({'malformed_view', {Class, Reason}}, State)
+            {'error', {'malformed_view', {Class, Reason}}}
     end.
 
--spec bounded_decoder_state(fun((term()) -> term()), #state{}) ->
-          'ok' | no_return().
-bounded_decoder_state(DecodeFun, State) ->
+-spec bounded_decoder_result(fun((term()) -> term())) ->
+          {'ok', 'complete' | fun((term()) -> term())} | {'error', term()}.
+bounded_decoder_result(DecodeFun) ->
     try DecodeFun('end_stream') of
         'done' ->
+            {'ok', 'complete'};
+        Unexpected ->
+            {'error', {'malformed_view',
+                       {'unexpected_decoder_state', Unexpected}}}
+    catch
+        'error':'badarg' ->
+            {'ok', DecodeFun};
+        Class:Reason ->
+            {'error', {'malformed_view', {Class, Reason}}}
+    end.
+
+-spec await_bounded_decode(reference(), pid(), reference(), #state{}) ->
+          'ok' | no_return().
+await_bounded_decode(Token, DecoderPid, MonitorRef,
+                     #state{ref=StreamRef}=State) ->
+    Timeout = receive_timeout(State),
+    receive
+        {Token, Result} ->
+            erlang:demonitor(MonitorRef, ['flush']),
+            Rows = take_decoder_rows(StreamRef, []),
+            finish_bounded_decode(Result, Rows, State);
+        {'DOWN', MonitorRef, 'process', DecoderPid, Reason} ->
+            flush_bounded_decode_result(Token),
+            discard_decoder_rows(StreamRef),
+            fail_stream({'malformed_view', {'decoder_down', Reason}}, State)
+    after Timeout ->
+            exit(DecoderPid, 'kill'),
+            receive
+                {'DOWN', MonitorRef, 'process', DecoderPid, _Reason} -> 'ok'
+            end,
+            flush_bounded_decode_result(Token),
+            discard_decoder_rows(StreamRef),
+            fail_stream('timeout', State)
+    end.
+
+-spec finish_bounded_decode(
+        {'ok', 'complete' | fun((term()) -> term())} | {'error', term()},
+        [term()], #state{}) -> 'ok' | no_return().
+finish_bounded_decode(Result, Rows, State) ->
+    case budget_status(State) of
+        {'error', 'timeout'} ->
+            fail_stream('timeout', State);
+        'ok' ->
+            finish_bounded_decode_result(Result, Rows, State)
+    end.
+
+-spec finish_bounded_decode_result(
+        {'ok', 'complete' | fun((term()) -> term())} | {'error', term()},
+        [term()], #state{}) -> 'ok' | no_return().
+finish_bounded_decode_result({'error', Reason}, _Rows, State) ->
+    fail_stream(Reason, State);
+finish_bounded_decode_result({'ok', Decoder}, Rows,
+                             #state{owner=Owner}=State) ->
+    lists:foreach(fun(Message) -> Owner ! Message end, Rows),
+    case Decoder of
+        'complete' ->
             %% JSON may finish before the HTTP body. Keep reading raw chunks so
             %% the response byte cap covers trailing bytes as well.
             loop(State#state{decoder='complete'});
-        Unexpected ->
-            fail_stream({'malformed_view',
-                         {'unexpected_decoder_state', Unexpected}}, State)
-    catch
-        'error':'badarg' ->
-            maybe_continue(State#state{decoder=DecodeFun});
-        Class:Reason ->
-            fail_stream({'malformed_view', {Class, Reason}}, State)
+        DecodeFun ->
+            maybe_continue(State#state{decoder=DecodeFun})
+    end.
+
+-spec take_decoder_rows(reference(), [term()]) -> [term()].
+take_decoder_rows(StreamRef, Acc) ->
+    receive
+        {StreamRef, {'row', _}=Row} ->
+            take_decoder_rows(StreamRef, [{StreamRef, Row} | Acc])
+    after 0 ->
+            lists:reverse(Acc)
+    end.
+
+-spec discard_decoder_rows(reference()) -> 'ok'.
+discard_decoder_rows(StreamRef) ->
+    _ = take_decoder_rows(StreamRef, []),
+    'ok'.
+
+-spec flush_bounded_decode_result(reference()) -> 'ok'.
+flush_bounded_decode_result(Token) ->
+    receive
+        {Token, _} -> flush_bounded_decode_result(Token)
+    after 0 ->
+            'ok'
     end.
 
 -spec only_json_whitespace(binary()) -> boolean().
@@ -269,6 +360,40 @@ only_json_whitespace(<<Char, Rest/binary>>)
     only_json_whitespace(Rest);
 only_json_whitespace(_) ->
     'false'.
+
+-spec start_view_request(term(), term(), list(), term(), list(),
+                         'undefined' | couchbeam_httpc:request_budget()) ->
+          term().
+start_view_request(Method, Url, Headers, Body, Options, 'undefined') ->
+    couchbeam_httpc:request(Method, Url, Headers, Body, Options);
+start_view_request(Method, Url, Headers, Body, Options, Budget) ->
+    couchbeam_httpc:request_bounded(
+      Method, Url, Headers, Body, Options, Budget).
+
+-spec decoder_owner(#state{}) -> pid().
+decoder_owner(#state{owner=Owner, budget='undefined'}) ->
+    Owner;
+decoder_owner(#state{}) ->
+    self().
+
+-ifdef(TEST).
+-spec decode_test_delay(list()) -> non_neg_integer().
+decode_test_delay(Options) ->
+    case proplists:get_value('bounded_decode_test_delay_ms', Options, 0) of
+        Delay when is_integer(Delay), Delay >= 0 -> Delay;
+        _ -> 0
+    end.
+-else.
+-spec decode_test_delay(list()) -> 0.
+decode_test_delay(_Options) ->
+    0.
+-endif.
+
+-spec maybe_delay_decode(non_neg_integer()) -> 'ok'.
+maybe_delay_decode(0) ->
+    'ok';
+maybe_delay_decode(Delay) ->
+    timer:sleep(Delay).
 
 -spec request_options(list(),
                       'undefined' | couchbeam_httpc:request_budget()) -> list().
@@ -319,6 +444,15 @@ fail_stream(Reason, #state{owner=Owner, ref=StreamRef,
     report_error(Reason, StreamRef, Owner),
     exit('normal').
 
+-spec fail_or_report_stream(term(), #state{}) -> no_return().
+fail_or_report_stream(Error, #state{owner=Owner, ref=StreamRef,
+                                    budget='undefined'}) ->
+    ets:delete(couchbeam_view_streams, StreamRef),
+    report_error(Error, StreamRef, Owner),
+    exit(Error);
+fail_or_report_stream(Error, State) ->
+    fail_stream(Error, State).
+
 -spec maybe_cancel_request(reference(),
                            'undefined' | couchbeam_httpc:request_budget()) ->
           'ok'.
@@ -353,9 +487,7 @@ maybe_continue(#state{parent=Parent,
             report_error({error, closed}, Ref, Owner),
             exit({error, closed});
         {hackney_response, ClientRef, {error, _}=Error} ->
-            %% report the error
-            report_error(Error, Ref, Owner),
-            exit(Error);
+            fail_or_report_stream(Error, State);
         {Ref, stream_next} ->
             loop(State);
         {Ref, cancel} ->
@@ -394,9 +526,7 @@ maybe_continue(#state{parent=Parent,
             report_error({error, closed}, Ref, Owner),
             exit({error, closed});
         {hackney_response, ClientRef, {error, _}=Error} ->
-            %% report the error
-            report_error(Error, Ref, Owner),
-            exit(Error);
+            fail_or_report_stream(Error, State);
         {Ref, cancel} ->
             maybe_close(State),
             %% unregister the stream
