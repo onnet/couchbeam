@@ -317,9 +317,15 @@ bounded_cleanup_budget(#{'timeout_ms' := TimeoutMs}=Budget) ->
         {'pending', couchbeam_httpc:request_budget()},
         couchbeam_httpc:request_budget()) -> couchbeam_httpc:request_budget().
 bounded_cleanup_wait_budget({'pending', CleanupBudget}, _FallbackBudget) ->
-    CleanupBudget;
+    bounded_cleanup_delivery_budget(CleanupBudget);
 bounded_cleanup_wait_budget(_CleanupState, FallbackBudget) ->
     FallbackBudget.
+
+-spec bounded_cleanup_delivery_budget(couchbeam_httpc:request_budget()) ->
+          couchbeam_httpc:request_budget().
+bounded_cleanup_delivery_budget(#{'deadline_ms' := CleanupDeadline,
+                                  'timeout_ms' := TimeoutMs}=Budget) ->
+    Budget#{'deadline_ms' => CleanupDeadline + TimeoutMs}.
 
 -spec bounded_view_terminal(reference(), reference(), term()) -> term().
 bounded_view_terminal(Ref, MonitorRef, Result) ->
