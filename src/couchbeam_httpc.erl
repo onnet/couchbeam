@@ -15,6 +15,10 @@
          make_headers/4,
          maybe_oauth_header/4]).
 -export_type([request_budget_spec/0, request_budget/0]).
+
+-ifdef(TEST).
+-export([decode_bounded_json/3]).
+-endif.
 %% urls utils
 -export([server_url/1, db_url/1, doc_url/2]).
 %% atts utols
@@ -40,12 +44,13 @@ db_request(Method, Url, Headers, Body, Options) ->
     db_request(Method, Url, Headers, Body, Options, []).
 
 db_request(Method, Url, Headers, Body, Options, Expect) ->
-    Resp = request(Method, Url, Headers, Body, Options),
     case couchbeam_util:get_value('request_budget', Options) of
         #{'deadline_ms' := _, 'max_response_bytes' := _}=Budget ->
+            Resp = bounded_request(Method, Url, Headers, Body,
+                                   Options, Budget),
             db_resp_bounded(Resp, Expect, Budget);
         _ ->
-            db_resp(Resp, Expect)
+            db_resp(request(Method, Url, Headers, Body, Options), Expect)
     end.
 
 json_body(Ref) ->
@@ -69,7 +74,7 @@ new_request_budget(_) ->
 bounded_json_body(Ref, #{'deadline_ms' := _,
                          'max_response_bytes' := _}=Budget) ->
     case bounded_binary_body(Ref, Budget) of
-        {'ok', Body, Bytes} -> decode_bounded_json(Body, Bytes);
+        {'ok', Body, Bytes} -> decode_bounded_json(Body, Bytes, Budget);
         {'error', _}=Error -> Error
     end;
 bounded_json_body(Ref, _) ->
@@ -83,54 +88,202 @@ cancel_request(Ref) ->
 -spec bounded_binary_body(reference(), request_budget()) ->
           {'ok', binary(), non_neg_integer()} | {'error', term()}.
 bounded_binary_body(Ref, Budget) ->
-    bounded_body(Ref, Budget, <<>>, 0).
+    bounded_body(Ref, Budget, [], 0).
 
--spec bounded_body(reference(), request_budget(), binary(), non_neg_integer()) ->
+-spec bounded_body(reference(), request_budget(), [binary()],
+                   non_neg_integer()) ->
           {'ok', binary(), non_neg_integer()} | {'error', term()}.
 bounded_body(Ref, Budget, Acc, Bytes) ->
     case remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
-            _ = hackney:setopts(Ref, [{'recv_timeout', TimeoutMs}]),
-            bounded_body_chunk(hackney:stream_body(Ref), Ref,
-                               Budget, Acc, Bytes);
+            case hackney:stream_next(Ref) of
+                'ok' ->
+                    receive
+                        {'hackney_response', Ref, Message} ->
+                            bounded_body_chunk(
+                              Message, Ref, Budget, Acc, Bytes)
+                    after TimeoutMs ->
+                            close_request(Ref),
+                            {'error', 'timeout'}
+                    end;
+                {'error', Reason} ->
+                    close_request(Ref),
+                    {'error', Reason}
+            end;
         _ ->
             close_request(Ref),
             {'error', 'timeout'}
     end.
 
--spec bounded_body_chunk(term(), reference(), request_budget(), binary(),
+-spec bounded_body_chunk(term(), reference(), request_budget(), [binary()],
                          non_neg_integer()) ->
           {'ok', binary(), non_neg_integer()} | {'error', term()}.
-bounded_body_chunk({'ok', Chunk}, Ref,
+bounded_body_chunk(Chunk, Ref,
                    #{'max_response_bytes' := MaxBytes}=Budget, Acc, Bytes) ->
-    NewBytes = Bytes + byte_size(Chunk),
-    case NewBytes =< MaxBytes of
-        'true' -> bounded_body(Ref, Budget, <<Acc/binary, Chunk/binary>>, NewBytes);
+    case is_binary(Chunk) of
+        'true' ->
+            NewBytes = Bytes + byte_size(Chunk),
+            case NewBytes =< MaxBytes of
+                'true' -> bounded_body(
+                            Ref, Budget, [Chunk | Acc], NewBytes);
+                'false' ->
+                    close_request(Ref),
+                    {'error', 'response_too_large'}
+            end;
         'false' ->
-            close_request(Ref),
-            {'error', 'response_too_large'}
-    end;
-bounded_body_chunk('done', Ref, Budget, Acc, Bytes) ->
+            bounded_body_control(Chunk, Ref, Budget, Acc, Bytes)
+    end.
+
+-spec bounded_body_control(term(), reference(), request_budget(), [binary()],
+                           non_neg_integer()) ->
+          {'ok', binary(), non_neg_integer()} | {'error', term()}.
+bounded_body_control('done', Ref, Budget, Acc, Bytes) ->
+    bounded_body_done(Ref, Budget, Acc, Bytes);
+bounded_body_control({'error', Reason}, Ref, _Budget, _Acc, _Bytes) ->
+    close_request(Ref),
+    {'error', Reason};
+bounded_body_control(Unexpected, Ref, _Budget, _Acc, _Bytes) ->
+    close_request(Ref),
+    {'error', {'unexpected_response_message', Unexpected}}.
+
+-spec bounded_body_done(reference(), request_budget(), [binary()],
+                        non_neg_integer()) ->
+          {'ok', binary(), non_neg_integer()} | {'error', 'timeout'}.
+bounded_body_done(Ref, Budget, Acc, Bytes) ->
     case remaining_timeout(Budget) of
-        TimeoutMs when TimeoutMs > 0 -> {'ok', Acc, Bytes};
+        TimeoutMs when TimeoutMs > 0 ->
+            {'ok', iolist_to_binary(lists:reverse(Acc)), Bytes};
         _ ->
             close_request(Ref),
             {'error', 'timeout'}
-    end;
-bounded_body_chunk({'error', 'timeout'}, Ref, _Budget, _Acc, _Bytes) ->
-    close_request(Ref),
-    {'error', 'timeout'};
-bounded_body_chunk({'error', Reason}, Ref, _Budget, _Acc, _Bytes) ->
-    close_request(Ref),
-    {'error', Reason}.
+    end.
 
--spec decode_bounded_json(binary(), non_neg_integer()) ->
+-spec decode_bounded_json(binary(), non_neg_integer(), request_budget()) ->
           {'ok', term(), non_neg_integer()} | {'error', term()}.
-decode_bounded_json(Body, Bytes) ->
+decode_bounded_json(Body, Bytes, Budget) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            decode_with_watchdog(Body, Bytes, Budget);
+        _ ->
+            {'error', 'timeout'}
+    end.
+
+-spec decode_with_watchdog(binary(), non_neg_integer(), request_budget()) ->
+          {'ok', term(), non_neg_integer()} | {'error', term()}.
+decode_with_watchdog(Body, Bytes, Budget) ->
+    Parent = self(),
+    Token = make_ref(),
+    {DecoderPid, MonitorRef} = spawn_monitor(
+                                 fun() ->
+                                         Parent ! {Token,
+                                                   decode_json_result(Body)}
+                                 end),
+    WatchdogMs = erlang:max(0, remaining_timeout(Budget)),
+    receive
+        {Token, {'ok', Json}} ->
+            erlang:demonitor(MonitorRef, ['flush']),
+            guarded_decode_result({'ok', Json}, Bytes, Budget);
+        {Token, {'error', _}=Error} ->
+            erlang:demonitor(MonitorRef, ['flush']),
+            guarded_decode_result(Error, Bytes, Budget);
+        {'DOWN', MonitorRef, 'process', DecoderPid, Reason} ->
+            flush_decode_result(Token),
+            {'error', {'invalid_json', Reason}}
+    after WatchdogMs ->
+            exit(DecoderPid, 'kill'),
+            receive
+                {'DOWN', MonitorRef, 'process', DecoderPid, _} -> 'ok'
+            end,
+            flush_decode_result(Token),
+            {'error', 'timeout'}
+    end.
+
+-spec guarded_decode_result({'ok', term()} | {'error', term()},
+                            non_neg_integer(), request_budget()) ->
+          {'ok', term(), non_neg_integer()} | {'error', term()}.
+guarded_decode_result(Result, Bytes, Budget) ->
+    case remaining_timeout(Budget) of
+        Remaining when Remaining > 0 ->
+            case Result of
+                {'ok', Json} -> {'ok', Json, Bytes};
+                {'error', _}=Error -> Error
+            end;
+        _ ->
+            {'error', 'timeout'}
+    end.
+
+-spec decode_json_result(binary()) -> {'ok', term()} | {'error', term()}.
+decode_json_result(Body) ->
     try couchbeam_ejson:decode(Body) of
-        Json -> {'ok', Json, Bytes}
+        Json -> {'ok', Json}
     catch
-        'error':Reason -> {'error', {'invalid_json', Reason}}
+        Class:Reason -> {'error', {'invalid_json', {Class, Reason}}}
+    end.
+
+-spec flush_decode_result(reference()) -> 'ok'.
+flush_decode_result(Token) ->
+    receive
+        {Token, _} -> flush_decode_result(Token)
+    after 0 ->
+            'ok'
+    end.
+
+-spec bounded_request(term(), term(), list(), term(), list(),
+                      request_budget()) -> term().
+bounded_request(Method, Url, Headers, Body, Options, Budget) ->
+    case request(Method, Url, Headers, Body,
+                 [{'async', 'once'} | Options]) of
+        {'ok', Ref} -> bounded_response_status(Ref, Budget);
+        Error -> Error
+    end.
+
+-spec bounded_response_status(reference(), request_budget()) -> term().
+bounded_response_status(Ref, Budget) ->
+    bounded_response_receive(
+      Ref, Budget,
+      fun({'status', Status, _Reason}) ->
+              case hackney:stream_next(Ref) of
+                  'ok' -> bounded_response_headers(Ref, Status, Budget);
+                  {'error', Reason} ->
+                      close_request(Ref),
+                      {'error', Reason}
+              end;
+         ({'error', Reason}) ->
+              close_request(Ref),
+              {'error', Reason};
+         (Unexpected) ->
+              close_request(Ref),
+              {'error', {'unexpected_response_message', Unexpected}}
+      end).
+
+-spec bounded_response_headers(reference(), integer(), request_budget()) ->
+          term().
+bounded_response_headers(Ref, Status, Budget) ->
+    bounded_response_receive(
+      Ref, Budget,
+      fun({'headers', Headers}) -> {'ok', Status, Headers, Ref};
+         ({'error', Reason}) ->
+              close_request(Ref),
+              {'error', Reason};
+         (Unexpected) ->
+              close_request(Ref),
+              {'error', {'unexpected_response_message', Unexpected}}
+      end).
+
+-spec bounded_response_receive(reference(), request_budget(), fun((term()) -> term())) ->
+          term().
+bounded_response_receive(Ref, Budget, Handler) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'hackney_response', Ref, Message} -> Handler(Message)
+            after TimeoutMs ->
+                    close_request(Ref),
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            close_request(Ref),
+            {'error', 'timeout'}
     end.
 
 -spec request_options(list()) -> {'ok', list()} | {'error', term()}.
