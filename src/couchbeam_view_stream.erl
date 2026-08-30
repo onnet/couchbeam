@@ -93,17 +93,19 @@ init_stream(Parent, Owner, StreamRef, {_Db, _Url, _Args}=Req,
     ok.
 
 do_init_stream({#db{options=Opts}, Url, Args},
-               #state{ref=StreamRef, mref=MRef, budget=Budget}=State) ->
+               #state{owner=LifecycleOwner, ref=StreamRef,
+                      mref=MRef, budget=Budget}=State) ->
     %% we are doing the request asynchronously
     FinalOpts = request_options([{'async', 'once'} | Opts], Budget),
     Reply = case Args#view_query_args.method of
         get ->
-            start_view_request(get, Url, [], <<>>, FinalOpts, Budget);
+            start_view_request(get, Url, [], <<>>, FinalOpts, Budget,
+                               LifecycleOwner);
         post ->
             Headers = [{<<"Content-Type">>, <<"application/json">>}],
             start_view_post_request(Url, Headers,
                                     Args#view_query_args.keys,
-                                    FinalOpts, Budget)
+                                    FinalOpts, Budget, LifecycleOwner)
     end,
 
     case Reply of
@@ -364,25 +366,31 @@ only_json_whitespace(_) ->
     'false'.
 
 -spec start_view_request(term(), term(), list(), term(), list(),
-                         'undefined' | couchbeam_httpc:request_budget()) ->
+                         'undefined' | couchbeam_httpc:request_budget(),
+                         pid()) ->
           term().
-start_view_request(Method, Url, Headers, Body, Options, 'undefined') ->
+start_view_request(Method, Url, Headers, Body, Options, 'undefined',
+                   _LifecycleOwner) ->
     couchbeam_httpc:request(Method, Url, Headers, Body, Options);
-start_view_request(Method, Url, Headers, Body, Options, Budget) ->
+start_view_request(Method, Url, Headers, Body, Options, Budget,
+                   LifecycleOwner) ->
     couchbeam_httpc:request_bounded(
-      Method, Url, Headers, Body, Options, Budget).
+      Method, Url, Headers, Body, Options, Budget, LifecycleOwner).
 
 -spec start_view_post_request(term(), list(), list(), list(),
                               'undefined' |
-                              couchbeam_httpc:request_budget()) -> term().
-start_view_post_request(Url, Headers, Keys, Options, 'undefined') ->
+                              couchbeam_httpc:request_budget(), pid()) -> term().
+start_view_post_request(Url, Headers, Keys, Options, 'undefined',
+                        _LifecycleOwner) ->
     Body = couchbeam_ejson:encode({[{<<"keys">>, Keys}]}),
     couchbeam_httpc:request(post, Url, Headers, Body, Options);
-start_view_post_request(Url, Headers, Keys, Options, Budget) ->
+start_view_post_request(Url, Headers, Keys, Options, Budget,
+                        LifecycleOwner) ->
     case couchbeam_httpc:bounded_encode_json(
            {[{<<"keys">>, Keys}]}, Budget, Options) of
         {'ok', Body} ->
-            start_view_request(post, Url, Headers, Body, Options, Budget);
+            start_view_request(post, Url, Headers, Body, Options, Budget,
+                               LifecycleOwner);
         {'error', _}=Error ->
             Error
     end.

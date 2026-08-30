@@ -494,6 +494,65 @@ bounded_view_post_cancels_stalled_upload_test() ->
                 Db, 'all_docs', [{'keys', [Key]}], {500, 1024})
       end).
 
+bounded_view_owner_death_cancels_post_transport_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    ensure_couchbeam_supervisor(),
+    Capacity = measured_send_capacity(),
+    Key = binary:copy(<<"k">>, Capacity * 256),
+    Parent = self(),
+    with_http_server(
+      fun(Socket, ServerParent) ->
+              ServerParent ! {'owner_death_upload_ready', self()},
+              receive 'observe_owner_close' -> 'ok' end,
+              ServerParent ! {'owner_death_peer_close',
+                              recv_until_closed(Socket)},
+              ServerParent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'socket_options', [{'sndbuf', 4096}]},
+                          {'bounded_upload_test_hook', Parent}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Caller = spawn(
+                         fun() ->
+                                 Parent ! {'owner_death_result', self(),
+                                           couchbeam_view:fetch_bounded(
+                                             Db, 'all_docs',
+                                             [{'keys', [Key]}],
+                                             {2000, 1024})}
+                         end),
+              WorkerPid = receive
+                              {'bounded_upload_worker', Worker} -> Worker
+                          after 1000 ->
+                                  ?assert('false')
+                          end,
+              ServerPid = receive
+                              {'owner_death_upload_ready', Pid} -> Pid
+                          after 1000 ->
+                                  ?assert('false')
+                          end,
+              Ref = owned_request_ref(WorkerPid),
+              Started = erlang:monotonic_time('millisecond'),
+              exit(Caller, 'kill'),
+              ServerPid ! 'observe_owner_close',
+              ?assertEqual('ok', await_ref_absent(Ref, 200)),
+              receive
+                  {'owner_death_peer_close', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 200 ->
+                      ?assert('false')
+              end,
+              Elapsed = erlang:monotonic_time('millisecond') - Started,
+              ?assert(Elapsed < 200),
+              receive
+                  {'owner_death_result', Caller, _Result} -> ?assert('false')
+              after 0 ->
+                      'ok'
+              end
+      end).
+
 bounded_save_doc_encode_obeys_deadline_before_transport_test() ->
     assert_encode_deadline_before_transport(
       fun(Db) ->
@@ -576,23 +635,35 @@ bounded_view_decode_watchdog_cancels_transport_test() ->
     {'ok', _} = application:ensure_all_started('hackney'),
     ensure_couchbeam_supervisor(),
     Body = <<"{\"total_rows\":0,\"offset\":0,\"rows\":[]}">>,
+    Parent = self(),
     with_http_server(
-      fun(Socket, Parent) ->
+      fun(Socket, ServerParent) ->
               send_json_headers(Socket, byte_size(Body)),
               'ok' = gen_tcp:send(Socket, Body),
-              Parent ! {'peer_close_result', recv_until_closed(Socket)},
-              Parent ! {'server_done', self()}
+              ServerParent ! {'peer_close_result', recv_until_closed(Socket)},
+              ServerParent ! {'server_done', self()}
       end,
       fun(BaseUrl) ->
               Server = couchbeam:server_connection(
-                         BaseUrl, [{'no_proxy_env', 'true'}]),
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'bounded_handoff_test_hook', Parent}]),
               {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
               Started = erlang:monotonic_time('millisecond'),
-              ?assertEqual(
-                 {'error', 'timeout'},
-                 couchbeam_view:fetch_bounded(
-                   Db, 'all_docs',
-                   [{'bounded_decode_test_delay_ms', 200}], {50, 1024})),
+              {Caller, Ref} = start_captured_view_call(
+                                fun() ->
+                                        couchbeam_view:fetch_bounded(
+                                          Db, 'all_docs',
+                                          [{'bounded_decode_test_delay_ms',
+                                            200}], {50, 1024})
+                                end),
+              receive
+                  {'captured_view_result', Caller, Ref, Result, RefAbsent} ->
+                      ?assertEqual({'error', 'timeout'}, Result),
+                      ?assertEqual('true', RefAbsent)
+              after 1000 ->
+                      ?assert('false')
+              end,
               Elapsed = erlang:monotonic_time('millisecond') - Started,
               ?assert(Elapsed < 150),
               receive
@@ -718,24 +789,52 @@ owned_request_ref(WorkerPid, DeadlineMs) ->
             end
     end.
 
+await_ref_absent(Ref, TimeoutMs) ->
+    await_ref_absent_until(
+      Ref, erlang:monotonic_time('millisecond') + TimeoutMs).
+
+await_ref_absent_until(Ref, DeadlineMs) ->
+    case ets:lookup('hackney_manager_refs', Ref) of
+        [] -> 'ok';
+        [_] ->
+            case erlang:monotonic_time('millisecond') < DeadlineMs of
+                'true' ->
+                    erlang:yield(),
+                    await_ref_absent_until(Ref, DeadlineMs);
+                'false' ->
+                    {'error', 'timeout'}
+            end
+    end.
+
 assert_view_transport_error_closed(Phase) ->
     {'ok', _} = application:ensure_all_started('hackney'),
     ensure_couchbeam_supervisor(),
+    Parent = self(),
     with_http_server(
-      fun(Socket, Parent) ->
+      fun(Socket, ServerParent) ->
               maybe_send_transport_error_headers(Socket, Phase),
               'ok' = gen_tcp:shutdown(Socket, 'write'),
-              Parent ! {'peer_close_result', recv_until_closed(Socket)},
-              Parent ! {'server_done', self()}
+              ServerParent ! {'peer_close_result', recv_until_closed(Socket)},
+              ServerParent ! {'server_done', self()}
       end,
       fun(BaseUrl) ->
               Server = couchbeam:server_connection(
-                         BaseUrl, [{'no_proxy_env', 'true'}]),
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'bounded_handoff_test_hook', Parent}]),
               {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
-              ?assertMatch(
-                 {'error', _},
-                 couchbeam_view:fetch_bounded(
-                   Db, 'all_docs', [], {1000, 1024})),
+              {Caller, Ref} = start_captured_view_call(
+                                fun() ->
+                                        couchbeam_view:fetch_bounded(
+                                          Db, 'all_docs', [], {1000, 1024})
+                                end),
+              receive
+                  {'captured_view_result', Caller, Ref, Result, RefAbsent} ->
+                      ?assertMatch({'error', _}, Result),
+                      ?assertEqual('true', RefAbsent)
+              after 1500 ->
+                      ?assert('false')
+              end,
               receive
                   {'peer_close_result', PeerResult} ->
                       ?assertEqual({'error', 'closed'}, PeerResult)
@@ -743,6 +842,26 @@ assert_view_transport_error_closed(Phase) ->
                   ?assert('false')
               end
       end).
+
+start_captured_view_call(CallFun) ->
+    Parent = self(),
+    Caller = spawn(
+               fun() ->
+                       Result = CallFun(),
+                       Ref = receive {'test_ref', TestRef} -> TestRef end,
+                       RefAbsent = ets:lookup('hackney_manager_refs', Ref) =:= [],
+                       Parent ! {'captured_view_result', self(), Ref,
+                                 Result, RefAbsent}
+               end),
+    receive
+        {'bounded_handoff_ready', Ref, StreamPid} ->
+            Caller ! {'test_ref', Ref},
+            StreamPid ! {'bounded_handoff_continue', Ref},
+            {Caller, Ref}
+    after 1000 ->
+            exit(Caller, 'kill'),
+            ?assert('false')
+    end.
 
 maybe_send_transport_error_headers(_Socket, 'status') ->
     'ok';

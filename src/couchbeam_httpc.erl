@@ -5,7 +5,7 @@
 
 -module(couchbeam_httpc).
 
--export([request/5, request_bounded/6,
+-export([request/5, request_bounded/6, request_bounded/7,
          db_request/5, db_request/6,
          json_body/1,
          bounded_json_body/2,
@@ -297,6 +297,13 @@ bounded_request(Method, Url, Headers, Body, Options, Budget) ->
 -spec request_bounded(term(), term(), list(), term(), list(), request_budget()) ->
           {'ok', reference()} | {'error', term()}.
 request_bounded(Method, Url, Headers, Body, Options, Budget) ->
+    request_bounded(Method, Url, Headers, Body, Options, Budget, self()).
+
+-spec request_bounded(term(), term(), list(), term(), list(), request_budget(),
+                      pid()) ->
+          {'ok', reference()} | {'error', term()}.
+request_bounded(Method, Url, Headers, Body, Options, Budget,
+                LifecycleOwner) ->
     Parent = self(),
     Token = make_ref(),
     LeasePid = spawn(fun transport_lease/0),
@@ -316,8 +323,8 @@ request_bounded(Method, Url, Headers, Body, Options, Budget) ->
                                         end
                                 end),
     notify_upload_worker(UploadHook, WorkerPid),
-    guard_request_worker(Parent, WorkerPid),
-    guard_transport_lease(Parent, LeasePid),
+    guard_request_worker(LifecycleOwner, WorkerPid),
+    guard_transport_lease(LifecycleOwner, LeasePid),
     await_bounded_request(Token, WorkerPid, MonitorRef, LeasePid,
                           HandoffHook, Budget).
 
