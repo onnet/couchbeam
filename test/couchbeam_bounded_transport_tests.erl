@@ -636,6 +636,285 @@ bounded_direct_caller_death_before_guardian_resources_test() ->
         gen_tcp:close(ListenSocket)
     end.
 
+bounded_guardian_post_start_cancel_waits_for_manager_cleanup_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    Parent = self(),
+    with_http_server(
+      fun(Socket, ServerParent) ->
+              ServerParent ! {'post_start_request_received', self()},
+              ServerParent ! {'post_start_peer_close',
+                              recv_until_closed(Socket)},
+              ServerParent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'bounded_guardian_started_test_hook', Parent}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Caller = spawn(
+                         fun() ->
+                                 Result = couchbeam:db_info_bounded(
+                                            Db, {100, 1024}),
+                                 receive 'publish_post_start_result' -> 'ok' end,
+                                 Parent ! {'post_start_result', self(), Result}
+                         end),
+              {GuardianPid, WorkerPid, LeasePid} = receive
+                  {'bounded_guardian_started_ready', Guardian, Worker, Lease,
+                   Caller} ->
+                      {Guardian, Worker, Lease}
+              after 1000 ->
+                      exit(Caller, 'kill'),
+                      ?assert('false')
+              end,
+              receive
+                  {'post_start_request_received', _ServerPid} -> 'ok'
+              after 1000 ->
+                      ?assert('false')
+              end,
+              Ref = owned_request_ref(WorkerPid),
+              LeaseMonitor = erlang:monitor('process', LeasePid),
+              exit(LeasePid, 'kill'),
+              receive
+                  {'DOWN', LeaseMonitor, 'process', LeasePid, _} -> 'ok'
+              after 200 ->
+                      ?assert('false')
+              end,
+              ?assertEqual('true', is_process_alive(GuardianPid)),
+              'ok' = sys:suspend('hackney_manager'),
+              try
+                  receive
+                      {'bounded_guardian_cleanup', 'started', GuardianPid,
+                       'undefined'} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  WorkerMonitor = erlang:monitor('process', WorkerPid),
+                  receive
+                      {'DOWN', WorkerMonitor, 'process', WorkerPid, _} ->
+                          'ok'
+                  after 200 ->
+                          ?assert('false')
+                  end,
+                  ?assertEqual('true', is_process_alive(GuardianPid)),
+                  ?assertMatch([_], ets:lookup('hackney_manager_refs', Ref)),
+                  receive
+                      {'post_start_result', Caller, _Result} -> ?assert('false');
+                      {'bounded_guardian_cleanup', 'complete', GuardianPid,
+                       _CleanupRef} -> ?assert('false')
+                  after 0 ->
+                          'ok'
+                  end
+              after
+                  'ok' = sys:resume('hackney_manager')
+              end,
+              receive
+                  {'bounded_guardian_cleanup', 'complete', GuardianPid,
+                   'undefined'} -> 'ok'
+              after 500 ->
+                      ?assert('false')
+              end,
+              ?assertEqual([], ets:lookup('hackney_manager_refs', Ref)),
+              receive
+                  {'post_start_peer_close', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 500 ->
+                      ?assert('false')
+              end,
+              Caller ! 'publish_post_start_result',
+              receive
+                  {'post_start_result', Caller, Result} ->
+                      ?assertEqual({'error', 'timeout'}, Result)
+              after 200 ->
+                      ?assert('false')
+              end,
+              ?assertEqual('false', is_process_alive(GuardianPid)),
+              ?assertEqual('false', is_process_alive(WorkerPid)),
+              ?assertEqual('false', is_process_alive(LeasePid))
+      end).
+
+bounded_guardian_reports_cleanup_failure_and_retries_on_owner_down_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    Parent = self(),
+    with_http_server(
+      fun(Socket, ServerParent) ->
+              ServerParent ! {'cleanup_failure_request_received', self()},
+              ServerParent ! {'cleanup_failure_peer_close',
+                              recv_until_closed(Socket)},
+              ServerParent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'bounded_guardian_started_test_hook', Parent}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Caller = spawn(
+                         fun() ->
+                                 Result = couchbeam:db_info_bounded(
+                                            Db, {100, 1024}),
+                                 Parent ! {'cleanup_failure_result', self(),
+                                           Result},
+                                 receive 'stop_cleanup_failure_caller' -> 'ok'
+                                 end
+                         end),
+              {GuardianPid, WorkerPid} = receive
+                  {'bounded_guardian_started_ready', Guardian, Worker, _Lease,
+                   Caller} ->
+                      {Guardian, Worker}
+              after 1000 ->
+                      exit(Caller, 'kill'),
+                      ?assert('false')
+              end,
+              receive
+                  {'cleanup_failure_request_received', _ServerPid} -> 'ok'
+              after 1000 ->
+                      ?assert('false')
+              end,
+              Ref = owned_request_ref(WorkerPid),
+              'ok' = sys:suspend('hackney_manager'),
+              try
+                  receive
+                      {'bounded_guardian_cleanup', 'started', GuardianPid,
+                       'undefined'} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  receive
+                      {'bounded_guardian_cleanup', 'failed', GuardianPid,
+                       'undefined'} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  receive
+                      {'cleanup_failure_result', Caller, Result} ->
+                          ?assertEqual(
+                             {'error', 'transport_cleanup_timeout'}, Result)
+                  after 200 ->
+                          ?assert('false')
+                  end,
+                  ?assertEqual('true', is_process_alive(GuardianPid)),
+                  ?assertMatch([_], ets:lookup('hackney_manager_refs', Ref))
+              after
+                  'ok' = sys:resume('hackney_manager')
+              end,
+              Caller ! 'stop_cleanup_failure_caller',
+              receive
+                  {'bounded_guardian_cleanup', 'started', GuardianPid,
+                   'undefined'} -> 'ok'
+              after 500 ->
+                      ?assert('false')
+              end,
+              receive
+                  {'bounded_guardian_cleanup', 'complete', GuardianPid,
+                   'undefined'} -> 'ok'
+              after 500 ->
+                      ?assert('false')
+              end,
+              ?assertEqual([], ets:lookup('hackney_manager_refs', Ref)),
+              receive
+                  {'cleanup_failure_peer_close', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 500 ->
+                      ?assert('false')
+              end,
+              ?assertEqual('false', is_process_alive(GuardianPid))
+      end).
+
+bounded_view_cleanup_uses_guardian_deadline_when_manager_suspended_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    ensure_couchbeam_supervisor(),
+    Parent = self(),
+    with_http_server(
+      fun(Socket, ServerParent) ->
+              ServerParent ! {'view_cleanup_request_received', self()},
+              ServerParent ! {'view_cleanup_peer_close',
+                              recv_until_closed(Socket)},
+              ServerParent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'bounded_guardian_started_test_hook', Parent}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Caller = spawn(
+                         fun() ->
+                                 Result = couchbeam_view:fetch_bounded(
+                                            Db, 'all_docs', [], {100, 1024}),
+                                 Parent ! {'view_cleanup_result', self(),
+                                           Result},
+                                 receive 'stop_view_cleanup_caller' -> 'ok' end
+                         end),
+              {GuardianPid, WorkerPid, ViewPid} = receive
+                  {'bounded_guardian_started_ready', Guardian, Worker, _Lease,
+                   StreamPid} ->
+                      {Guardian, Worker, StreamPid}
+              after 1000 ->
+                      exit(Caller, 'kill'),
+                      ?assert('false')
+              end,
+              ?assert(ViewPid =/= Caller),
+              GuardianMonitor = erlang:monitor('process', GuardianPid),
+              receive
+                  {'view_cleanup_request_received', _ServerPid} -> 'ok'
+              after 1000 ->
+                      ?assert('false')
+              end,
+              Ref = owned_request_ref(WorkerPid),
+              'ok' = sys:suspend('hackney_manager'),
+              try
+                  receive
+                      {'bounded_guardian_cleanup', 'started', GuardianPid,
+                       'undefined'} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  receive
+                      {'bounded_guardian_cleanup', 'failed', GuardianPid,
+                       'undefined'} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  receive
+                      {'view_cleanup_result', Caller, Result} ->
+                          ?assertEqual(
+                             {'error', 'transport_cleanup_timeout'}, Result)
+                  after 200 ->
+                          ?assert('false')
+                  end,
+                  ?assertEqual('true', is_process_alive(GuardianPid)),
+                  ?assertMatch([_], ets:lookup('hackney_manager_refs', Ref))
+              after
+                  'ok' = sys:resume('hackney_manager')
+              end,
+              receive
+                  {'bounded_guardian_cleanup', 'started', GuardianPid,
+                   'undefined'} -> 'ok'
+              after 500 ->
+                      ?assert('false')
+              end,
+              receive
+                  {'bounded_guardian_cleanup', 'complete', GuardianPid,
+                   'undefined'} -> 'ok'
+              after 500 ->
+                      ?assert('false')
+              end,
+              ?assertEqual([], ets:lookup('hackney_manager_refs', Ref)),
+              receive
+                  {'view_cleanup_peer_close', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 500 ->
+                      ?assert('false')
+              end,
+              Caller ! 'stop_view_cleanup_caller',
+              receive
+                  {'DOWN', GuardianMonitor, 'process', GuardianPid, _} -> 'ok'
+              after 200 ->
+                      ?assert('false')
+              end
+      end).
+
 bounded_save_doc_encode_obeys_deadline_before_transport_test() ->
     assert_encode_deadline_before_transport(
       fun(Db) ->

@@ -152,7 +152,8 @@ guard_ephemeral_worker(Parent, WorkerPid) ->
               end),
     'ok'.
 
--spec cancel_request(reference()) -> 'ok'.
+-spec cancel_request(reference()) ->
+          'ok' | {'error', 'transport_cleanup_timeout'}.
 cancel_request(Ref) ->
     close_request(Ref).
 
@@ -324,6 +325,7 @@ request_bounded(Method, Url, Headers, Body, Options, Budget,
     UploadHook = upload_test_hook(Options),
     UploadContextHook = upload_context_test_hook(Options),
     GuardianHook = guardian_ready_test_hook(Options),
+    GuardianStartedHook = guardian_started_test_hook(Options),
     RequestOptions = [{'async', 'once'}, {'stream_to', Parent}
                       | proplists:delete(
                           'async', proplists:delete(
@@ -337,12 +339,11 @@ request_bounded(Method, Url, Headers, Body, Options, Budget,
                    GuardianHook, GuardianPid, Budget) of
                 'ok' ->
                     GuardianPid ! {Token, 'start', RequestFun, UploadHook,
-                                   UploadContextHook},
+                                   UploadContextHook, GuardianStartedHook},
                     await_guardian_resources(
                       Token, GuardianPid, HandoffHook, Budget);
                 {'error', _}=Error ->
-                    exit(GuardianPid, 'kill'),
-                    Error
+                    guardian_cancel_result(GuardianPid, Budget, Error)
             end;
         {'error', _}=Error ->
             Error
@@ -391,7 +392,8 @@ monitor_request_owners(Parent, LifecycleOwner) ->
 request_guardian_await_start(Parent, LifecycleOwner, Token, Budget,
                              OwnerMonitors) ->
     receive
-        {Token, 'start', RequestFun, UploadHook, UploadContextHook} ->
+        {Token, 'start', RequestFun, UploadHook, UploadContextHook,
+         GuardianStartedHook} ->
             LeasePid = spawn(fun transport_lease/0),
             WorkerPid = spawn(
                           fun() ->
@@ -406,10 +408,21 @@ request_guardian_await_start(Parent, LifecycleOwner, Token, Budget,
             notify_upload_worker(UploadHook, WorkerPid),
             notify_upload_context(
               UploadContextHook, WorkerPid, LeasePid, self(), Parent),
-            Parent ! {Token, 'guardian_started', self(), WorkerPid, LeasePid},
-            request_guardian_loop(
-              Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
-              WorkerPid, WorkerRef, LeasePid, LeaseRef, 'undefined');
+            State = #{'parent' => Parent,
+                      'lifecycle_owner' => LifecycleOwner,
+                      'token' => Token,
+                      'budget' => Budget,
+                      'owner_monitors' => OwnerMonitors,
+                      'worker_pid' => WorkerPid,
+                      'worker_ref' => WorkerRef,
+                      'lease_pid' => LeasePid,
+                      'lease_ref' => LeaseRef,
+                      'request_ref' => 'undefined',
+                      'guardian_started_hook' => GuardianStartedHook},
+            request_guardian_before_started(GuardianStartedHook, State);
+        {'bounded_guardian_cancel', From} ->
+            From ! {'bounded_guardian_cleanup_ack', self(), 'ok'},
+            exit('normal');
         {'DOWN', MonitorRef, 'process', _Pid, _Reason} ->
             case lists:member(MonitorRef, OwnerMonitors) of
                 'true' -> exit('normal');
@@ -419,60 +432,146 @@ request_guardian_await_start(Parent, LifecycleOwner, Token, Budget,
             end
     end.
 
--spec request_guardian_loop(pid(), pid(), reference(), request_budget(),
-                            [reference()], pid(), 'down' | reference(), pid(),
-                            reference(), 'undefined' | reference()) ->
-          no_return().
-request_guardian_loop(Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
-                      WorkerPid, WorkerRef, LeasePid, LeaseRef, Ref) ->
+-spec request_guardian_before_started('undefined' | pid(), map()) -> no_return().
+request_guardian_before_started('undefined', State) ->
+    request_guardian_publish_started(State);
+request_guardian_before_started(HookPid,
+                                #{'parent' := Parent,
+                                  'worker_pid' := WorkerPid,
+                                  'lease_pid' := LeasePid}=State) ->
+    HookPid ! {'bounded_guardian_started_ready', self(), WorkerPid,
+               LeasePid, Parent},
+    request_guardian_before_started_wait(State).
+
+-spec request_guardian_before_started_wait(map()) -> no_return().
+request_guardian_before_started_wait(#{'owner_monitors' := OwnerMonitors}=State) ->
     receive
-        {Token, 'known_ref', KnownRef, From} ->
-            From ! {Token, 'known_ref_ack', self(), KnownRef},
-            request_guardian_loop(
-              Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
-              WorkerPid, WorkerRef, LeasePid, LeaseRef, KnownRef);
+        {'bounded_guardian_started_continue', GuardianPid}
+          when GuardianPid =:= self() ->
+            request_guardian_publish_started(State);
+        {'bounded_guardian_cancel', From} ->
+            request_guardian_cleanup(State, From);
         {'DOWN', MonitorRef, 'process', _Pid, _Reason} ->
             case lists:member(MonitorRef, OwnerMonitors) of
-                'true' ->
-                    guardian_cancel_dependents(
-                      Parent, LifecycleOwner, Budget, WorkerPid, WorkerRef,
-                      LeasePid, LeaseRef, Ref);
-                'false' when MonitorRef =:= LeaseRef ->
-                    exit('normal');
-                'false' when MonitorRef =:= WorkerRef ->
-                    request_guardian_loop(
-                      Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
-                      WorkerPid, 'down', LeasePid, LeaseRef, Ref);
+                'true' -> request_guardian_cleanup(State, 'undefined');
                 'false' ->
-                    request_guardian_loop(
-                      Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
-                      WorkerPid, WorkerRef, LeasePid, LeaseRef, Ref)
+                    request_guardian_before_started_wait(
+                      guardian_mark_dependent_down(MonitorRef, State))
             end
     end.
 
--spec guardian_cancel_dependents(pid(), pid(), request_budget(), pid(),
-                                 'down' | reference(), pid(), reference(),
-                                 'undefined' | reference()) -> no_return().
-guardian_cancel_dependents(Parent, LifecycleOwner, Budget, WorkerPid,
-                           WorkerRef, LeasePid, LeaseRef, Ref) ->
+-spec request_guardian_publish_started(map()) -> no_return().
+request_guardian_publish_started(#{'parent' := Parent,
+                                   'token' := Token,
+                                   'worker_pid' := WorkerPid,
+                                   'lease_pid' := LeasePid}=State) ->
+    Parent ! {Token, 'guardian_started', self(), WorkerPid, LeasePid},
+    request_guardian_loop(State).
+
+-spec request_guardian_loop(map()) -> no_return().
+request_guardian_loop(#{'token' := Token,
+                        'owner_monitors' := OwnerMonitors}=State) ->
+    receive
+        {Token, 'known_ref', KnownRef, From} ->
+            From ! {Token, 'known_ref_ack', self(), KnownRef},
+            request_guardian_loop(State#{'request_ref' => KnownRef});
+        {'bounded_guardian_cleanup_complete', KnownRef, From} ->
+            request_guardian_cleanup(
+              State#{'request_ref' => KnownRef}, From);
+        {'bounded_guardian_cancel', From} ->
+            request_guardian_cleanup(State, From);
+        {'DOWN', MonitorRef, 'process', _Pid, _Reason} ->
+            case lists:member(MonitorRef, OwnerMonitors) of
+                'true' ->
+                    request_guardian_cleanup(State, 'undefined');
+                'false' ->
+                    request_guardian_loop(
+                      guardian_mark_dependent_down(MonitorRef, State))
+            end
+    end.
+
+-spec guardian_mark_dependent_down(reference(), map()) -> map().
+guardian_mark_dependent_down(MonitorRef, #{'worker_ref' := MonitorRef}=State) ->
+    State#{'worker_ref' => 'down'};
+guardian_mark_dependent_down(MonitorRef, #{'lease_ref' := MonitorRef}=State) ->
+    State#{'lease_ref' => 'down'};
+guardian_mark_dependent_down(_MonitorRef, State) ->
+    State.
+
+-spec request_guardian_cleanup(map(), 'undefined' | pid()) -> no_return().
+request_guardian_cleanup(#{'parent' := Parent,
+                           'lifecycle_owner' := LifecycleOwner,
+                           'budget' := Budget,
+                           'worker_pid' := WorkerPid,
+                           'worker_ref' := WorkerRef,
+                           'lease_pid' := LeasePid,
+                           'lease_ref' := LeaseRef,
+                           'request_ref' := Ref,
+                           'guardian_started_hook' := TestHook}=State,
+                         AckPid) ->
+    notify_guardian_cleanup_test(TestHook, 'started', Ref),
     maybe_stop_guardian_worker(WorkerPid, WorkerRef),
-    exit(LeasePid, 'kill'),
+    maybe_stop_guardian_lease(LeasePid, LeaseRef),
     CleanupBudget = cleanup_deadline(Budget),
-    maybe_await_guardian_worker(WorkerPid, WorkerRef, CleanupBudget),
-    require_guardian_dependent_down(LeasePid, LeaseRef, CleanupBudget),
-    case Ref of
-        'undefined' ->
-            case await_owned_transport_cleanup(WorkerPid, CleanupBudget) of
-                'ok' -> 'ok';
-                {'error', 'timeout'} ->
-                    exit({'transport_cleanup_timeout', WorkerPid})
+    notify_lifecycle_cleanup_started(
+      LifecycleOwner, Parent, CleanupBudget),
+    CleanupResult = guardian_confirm_cleanup(
+                      WorkerPid, WorkerRef, LeasePid, LeaseRef, Ref,
+                      CleanupBudget),
+    case CleanupResult of
+        'ok' ->
+            notify_guardian_cleanup_test(TestHook, 'complete', Ref),
+            notify_lifecycle_cleanup(LifecycleOwner, Parent, Ref),
+            notify_guardian_cleanup_ack(AckPid, 'ok'),
+            exit('normal');
+        {'error', 'timeout'}=Error ->
+            notify_guardian_cleanup_test(TestHook, 'failed', Ref),
+            notify_guardian_cleanup_ack(AckPid, Error),
+            request_guardian_loop(
+              State#{'worker_ref' => guardian_down_state(WorkerPid, WorkerRef),
+                     'lease_ref' => guardian_down_state(LeasePid, LeaseRef)})
+    end.
+
+-spec notify_guardian_cleanup_test('undefined' | pid(), atom(),
+                                   'undefined' | reference()) -> 'ok'.
+notify_guardian_cleanup_test('undefined', _Phase, _Ref) ->
+    'ok';
+notify_guardian_cleanup_test(HookPid, Phase, Ref) ->
+    HookPid ! {'bounded_guardian_cleanup', Phase, self(), Ref},
+    'ok'.
+
+-spec guardian_confirm_cleanup(pid(), 'down' | reference(), pid(),
+                               'down' | reference(),
+                               'undefined' | reference(), request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+guardian_confirm_cleanup(WorkerPid, WorkerRef, LeasePid, LeaseRef, Ref,
+                         Budget) ->
+    case maybe_await_guardian_dependent(WorkerPid, WorkerRef, Budget) of
+        'ok' ->
+            case maybe_await_guardian_dependent(LeasePid, LeaseRef, Budget) of
+                'ok' -> guardian_confirm_transport_cleanup(
+                          WorkerPid, LeasePid, Ref, Budget);
+                {'error', 'timeout'}=Error -> Error
             end;
-        _ ->
-            require_ownership_barrier(Ref, LeasePid, CleanupBudget),
-            require_request_cleanup(Ref, CleanupBudget)
-    end,
-    notify_lifecycle_cleanup(LifecycleOwner, Parent, Ref),
-    exit('normal').
+        {'error', 'timeout'}=Error -> Error
+    end.
+
+-spec guardian_confirm_transport_cleanup(pid(), pid(),
+                                         'undefined' | reference(),
+                                         request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+guardian_confirm_transport_cleanup(WorkerPid, _LeasePid, 'undefined', Budget) ->
+    await_owned_transport_cleanup(WorkerPid, Budget);
+guardian_confirm_transport_cleanup(_WorkerPid, LeasePid, Ref, Budget) ->
+    _ = ownership_barrier(Ref, LeasePid, Budget),
+    await_request_cleanup(Ref, Budget).
+
+-spec notify_guardian_cleanup_ack('undefined' | pid(), term()) -> 'ok'.
+notify_guardian_cleanup_ack('undefined', _Result) ->
+    'ok';
+notify_guardian_cleanup_ack(AckPid, Result) ->
+    AckPid ! {'bounded_guardian_cleanup_ack', self(), Result},
+    'ok'.
 
 -spec maybe_stop_guardian_worker(pid(), 'down' | reference()) -> 'ok'.
 maybe_stop_guardian_worker(_WorkerPid, 'down') ->
@@ -481,12 +580,32 @@ maybe_stop_guardian_worker(WorkerPid, _WorkerRef) ->
     exit(WorkerPid, 'kill'),
     'ok'.
 
--spec maybe_await_guardian_worker(pid(), 'down' | reference(),
-                                  request_budget()) -> 'ok'.
-maybe_await_guardian_worker(_WorkerPid, 'down', _Budget) ->
+-spec maybe_stop_guardian_lease(pid(), 'down' | reference()) -> 'ok'.
+maybe_stop_guardian_lease(_LeasePid, 'down') ->
     'ok';
-maybe_await_guardian_worker(WorkerPid, WorkerRef, Budget) ->
-    require_guardian_dependent_down(WorkerPid, WorkerRef, Budget).
+maybe_stop_guardian_lease(LeasePid, _LeaseRef) ->
+    exit(LeasePid, 'kill'),
+    'ok'.
+
+-spec maybe_await_guardian_dependent(pid(), 'down' | reference(),
+                                    request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+maybe_await_guardian_dependent(_Pid, 'down', _Budget) ->
+    'ok';
+maybe_await_guardian_dependent(Pid, MonitorRef, Budget) ->
+    await_guardian_dependent_down(Pid, MonitorRef, Budget).
+
+-spec guardian_down_state(pid(), 'down' | reference()) ->
+          'down' | reference().
+guardian_down_state(_Pid, 'down') ->
+    'down';
+guardian_down_state(Pid, MonitorRef) ->
+    case is_process_alive(Pid) of
+        'true' -> MonitorRef;
+        'false' ->
+            erlang:demonitor(MonitorRef, ['flush']),
+            'down'
+    end.
 
 -spec await_guardian_dependent_down(pid(), reference(), request_budget()) ->
           'ok' | {'error', 'timeout'}.
@@ -500,14 +619,6 @@ await_guardian_dependent_down(Pid, MonitorRef, Budget) ->
             end;
         _ ->
             {'error', 'timeout'}
-    end.
-
--spec require_guardian_dependent_down(pid(), reference(), request_budget()) ->
-          'ok'.
-require_guardian_dependent_down(Pid, MonitorRef, Budget) ->
-    case await_guardian_dependent_down(Pid, MonitorRef, Budget) of
-        'ok' -> 'ok';
-        {'error', 'timeout'} -> exit({'transport_cleanup_timeout', Pid})
     end.
 
 -spec await_guardian_resources(reference(), pid(), term(), request_budget()) ->
@@ -528,13 +639,13 @@ await_guardian_resources(Token, GuardianPid, HandoffHook, Budget) ->
                     {'error', 'request_guardian_down'}
             after TimeoutMs ->
                     erlang:demonitor(GuardianRef, ['flush']),
-                    exit(GuardianPid, 'kill'),
-                    {'error', 'timeout'}
+                    guardian_cancel_result(
+                      GuardianPid, Budget, {'error', 'timeout'})
             end;
         _ ->
             erlang:demonitor(GuardianRef, ['flush']),
-            exit(GuardianPid, 'kill'),
-            {'error', 'timeout'}
+            guardian_cancel_result(
+              GuardianPid, Budget, {'error', 'timeout'})
     end.
 
 -spec transport_lease() -> no_return().
@@ -554,52 +665,50 @@ await_bounded_request(Token, WorkerPid, MonitorRef, LeasePid, GuardianPid,
                 {Token, {'ok', Ref}} when is_reference(Ref) ->
                     guardian_register_ref(GuardianPid, Token, Ref, Budget),
                     adopt_bounded_request(
-                      Token, WorkerPid, MonitorRef, LeasePid, Ref,
+                      Token, WorkerPid, MonitorRef, LeasePid, GuardianPid, Ref,
                       HandoffHook, Budget);
                 {Token, {'error', _}=Error} ->
-                    exit(LeasePid, 'kill'),
-                    release_request_worker(Token, WorkerPid, MonitorRef,
-                                           Budget),
-                    Error;
-                {Token, Unexpected} ->
-                    exit(LeasePid, 'kill'),
-                    release_request_worker(Token, WorkerPid, MonitorRef,
-                                           Budget),
-                    {'error', {'unexpected_request_result', Unexpected}};
-                {'DOWN', MonitorRef, 'process', WorkerPid, Reason} ->
-                    exit(LeasePid, 'kill'),
                     flush_request_result(Token),
-                    require_owner_cleanup(WorkerPid, Budget),
-                    {'error', {'request_worker_down', Reason}}
+                    guardian_cancel_result(GuardianPid, Budget, Error);
+                {Token, Unexpected} ->
+                    guardian_cancel_result(
+                      GuardianPid, Budget,
+                      {'error', {'unexpected_request_result', Unexpected}});
+                {'DOWN', MonitorRef, 'process', WorkerPid, Reason} ->
+                    flush_request_result(Token),
+                    guardian_cancel_result(
+                      GuardianPid, Budget,
+                      {'error', {'request_worker_down', Reason}})
             after TimeoutMs ->
-                    exit(LeasePid, 'kill'),
-                    abort_request_worker(Token, WorkerPid, MonitorRef, Budget),
-                    {'error', 'timeout'}
+                    guardian_cancel_result(
+                      GuardianPid, Budget, {'error', 'timeout'})
             end;
         _ ->
-            exit(LeasePid, 'kill'),
-            abort_request_worker(Token, WorkerPid, MonitorRef, Budget),
-            {'error', 'timeout'}
+            guardian_cancel_result(
+              GuardianPid, Budget, {'error', 'timeout'})
     end.
 
--spec adopt_bounded_request(reference(), pid(), reference(), pid(), reference(),
-                            term(), request_budget()) ->
+-spec adopt_bounded_request(reference(), pid(), reference(), pid(), pid(),
+                            reference(), term(), request_budget()) ->
           {'ok', reference()} | {'error', term()}.
-adopt_bounded_request(Token, WorkerPid, MonitorRef, LeasePid, Ref,
+adopt_bounded_request(Token, WorkerPid, MonitorRef, LeasePid, GuardianPid, Ref,
                       HandoffHook, Budget) ->
     case before_handoff(HandoffHook, Ref, Budget) of
         'ok' -> adopt_bounded_request_now(
-                  Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget);
+                  Token, WorkerPid, MonitorRef, LeasePid, GuardianPid, Ref,
+                  Budget);
         {'error', 'timeout'} ->
-            cleanup_failed_handoff(
-              Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget),
-            {'error', 'timeout'}
+            CleanupResult = cleanup_failed_handoff(
+                              Token, WorkerPid, MonitorRef, LeasePid,
+                              GuardianPid, Ref, Budget),
+            cleanup_result(CleanupResult, {'error', 'timeout'})
     end.
 
--spec adopt_bounded_request_now(reference(), pid(), reference(), pid(),
+-spec adopt_bounded_request_now(reference(), pid(), reference(), pid(), pid(),
                                 reference(), request_budget()) ->
           {'ok', reference()} | {'error', term()}.
-adopt_bounded_request_now(Token, WorkerPid, MonitorRef, LeasePid, Ref,
+adopt_bounded_request_now(Token, WorkerPid, MonitorRef, LeasePid, GuardianPid,
+                          Ref,
                           Budget) ->
     case remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
@@ -619,7 +728,8 @@ adopt_bounded_request_now(Token, WorkerPid, MonitorRef, LeasePid, Ref,
                               end,
             case OwnershipResult of
                 'ok' ->
-                    remember_owned_request(Ref, LeasePid, Budget),
+                    remember_owned_request(
+                      Ref, LeasePid, GuardianPid, Budget),
                     release_request_worker(Token, WorkerPid, MonitorRef,
                                            Budget),
                     case budget_status(Budget) of
@@ -629,36 +739,42 @@ adopt_bounded_request_now(Token, WorkerPid, MonitorRef, LeasePid, Ref,
                             {'error', 'timeout'}
                     end;
                 {'error', 'timeout'} ->
-                    cleanup_failed_handoff(
-                      Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget),
-                    {'error', 'timeout'};
+                    CleanupResult = cleanup_failed_handoff(
+                                      Token, WorkerPid, MonitorRef, LeasePid,
+                                      GuardianPid, Ref, Budget),
+                    cleanup_result(CleanupResult, {'error', 'timeout'});
                 OwnershipError ->
-                    cleanup_failed_handoff(
-                      Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget),
-                    {'error', {'request_ownership', OwnershipError}}
+                    CleanupResult = cleanup_failed_handoff(
+                                      Token, WorkerPid, MonitorRef, LeasePid,
+                                      GuardianPid, Ref, Budget),
+                    cleanup_result(
+                      CleanupResult,
+                      {'error', {'request_ownership', OwnershipError}})
             end;
         _ ->
-            cleanup_failed_handoff(
-              Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget),
-            {'error', 'timeout'}
+            CleanupResult = cleanup_failed_handoff(
+                              Token, WorkerPid, MonitorRef, LeasePid,
+                              GuardianPid, Ref, Budget),
+            cleanup_result(CleanupResult, {'error', 'timeout'})
     end.
 
--spec cleanup_failed_handoff(reference(), pid(), reference(), pid(),
-                             reference(), request_budget()) -> 'ok'.
-cleanup_failed_handoff(Token, WorkerPid, MonitorRef, LeasePid, Ref, Budget) ->
-    exit(LeasePid, 'kill'),
-    stop_request_worker(Token, WorkerPid, MonitorRef, Budget),
-    CleanupBudget = cleanup_deadline(Budget),
-    require_ownership_barrier(Ref, LeasePid, CleanupBudget),
-    require_request_cleanup(Ref, CleanupBudget),
-    flush_response_messages(Ref).
+-spec cleanup_failed_handoff(reference(), pid(), reference(), pid(), pid(),
+                             reference(), request_budget()) ->
+          'ok' | {'error', 'transport_cleanup_timeout'}.
+cleanup_failed_handoff(Token, _WorkerPid, _MonitorRef, _LeasePid, GuardianPid,
+                       Ref, Budget) ->
+    flush_request_result(Token),
+    CleanupResult = request_guardian_cleanup_complete(
+                      GuardianPid, Ref, Budget),
+    flush_response_messages(Ref),
+    CleanupResult.
 
--spec require_ownership_barrier(reference(), pid(), request_budget()) -> 'ok'.
-require_ownership_barrier(Ref, LeasePid, Budget) ->
-    case ownership_barrier(Ref, LeasePid, Budget) of
-        {'error', 'timeout'} -> exit({'transport_cleanup_timeout', Ref});
-        _ -> 'ok'
-    end.
+-spec cleanup_result('ok' | {'error', 'transport_cleanup_timeout'}, term()) ->
+          term().
+cleanup_result('ok', Result) ->
+    Result;
+cleanup_result({'error', 'transport_cleanup_timeout'}=Error, _Result) ->
+    Error.
 
 -spec ownership_barrier(reference(), pid(), request_budget()) -> term().
 ownership_barrier(Ref, LeasePid, Budget) ->
@@ -681,21 +797,6 @@ release_request_worker(Token, WorkerPid, MonitorRef, Budget) ->
     WorkerPid ! {Token, 'release'},
     require_worker_down(WorkerPid, MonitorRef, Budget),
     require_owner_cleanup(WorkerPid, Budget),
-    'ok'.
-
--spec abort_request_worker(reference(), pid(), reference(), request_budget()) ->
-          'ok'.
-abort_request_worker(Token, WorkerPid, MonitorRef, Budget) ->
-    stop_request_worker(Token, WorkerPid, MonitorRef, Budget),
-    require_owner_cleanup(WorkerPid, Budget),
-    'ok'.
-
--spec stop_request_worker(reference(), pid(), reference(), request_budget()) ->
-          'ok'.
-stop_request_worker(Token, WorkerPid, MonitorRef, Budget) ->
-    exit(WorkerPid, 'kill'),
-    require_worker_down(WorkerPid, MonitorRef, Budget),
-    flush_request_result(Token),
     'ok'.
 
 -spec require_worker_down(pid(), reference(), request_budget()) -> 'ok'.
@@ -774,21 +875,16 @@ await_request_cleanup(Ref, Budget) ->
             end
     end.
 
--spec require_request_cleanup(reference(), request_budget()) -> 'ok'.
-require_request_cleanup(Ref, Budget) ->
-    case await_request_cleanup(Ref, Budget) of
-        'ok' -> 'ok';
-        {'error', 'timeout'} -> exit({'transport_cleanup_timeout', Ref})
-    end.
-
 -spec cleanup_deadline(request_budget()) -> request_budget().
 cleanup_deadline(#{'timeout_ms' := TimeoutMs}=Budget) ->
     Budget#{'deadline_ms' =>
                 erlang:monotonic_time('millisecond') + TimeoutMs}.
 
--spec remember_owned_request(reference(), pid(), request_budget()) -> term().
-remember_owned_request(Ref, LeasePid, Budget) ->
-    put({'bounded_request_owner', Ref}, {LeasePid, Budget}).
+-spec remember_owned_request(reference(), pid(), pid(), request_budget()) ->
+          term().
+remember_owned_request(Ref, LeasePid, GuardianPid, Budget) ->
+    put({'bounded_request_owner', Ref},
+        {LeasePid, GuardianPid, Budget}).
 
 -spec flush_response_messages(reference()) -> 'ok'.
 flush_response_messages(Ref) ->
@@ -813,6 +909,49 @@ guardian_register_ref(GuardianPid, Token, Ref, Budget) ->
             exit({'transport_guardian_timeout', Ref})
     end.
 
+-spec guardian_cancel_result(pid(), request_budget(), term()) -> term().
+guardian_cancel_result(GuardianPid, Budget, Result) ->
+    GuardianPid ! {'bounded_guardian_cancel', self()},
+    case await_guardian_cleanup_ack(GuardianPid, cleanup_deadline(Budget)) of
+        'ok' -> Result;
+        {'error', 'timeout'} -> {'error', 'transport_cleanup_timeout'}
+    end.
+
+-spec request_guardian_cleanup_complete(pid(), reference(),
+                                        request_budget()) ->
+          'ok' | {'error', 'transport_cleanup_timeout'}.
+request_guardian_cleanup_complete(GuardianPid, Ref, Budget) ->
+    GuardianPid ! {'bounded_guardian_cleanup_complete', Ref, self()},
+    case await_guardian_cleanup_ack(GuardianPid, cleanup_deadline(Budget)) of
+        'ok' -> 'ok';
+        {'error', 'timeout'} -> {'error', 'transport_cleanup_timeout'}
+    end.
+
+-spec await_guardian_cleanup_ack(pid(), request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+await_guardian_cleanup_ack(GuardianPid, Budget) ->
+    MonitorRef = erlang:monitor('process', GuardianPid),
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'bounded_guardian_cleanup_ack', GuardianPid, 'ok'} ->
+                    erlang:demonitor(MonitorRef, ['flush']),
+                    'ok';
+                {'bounded_guardian_cleanup_ack', GuardianPid,
+                 {'error', 'timeout'}} ->
+                    erlang:demonitor(MonitorRef, ['flush']),
+                    {'error', 'timeout'};
+                {'DOWN', MonitorRef, 'process', GuardianPid, _Reason} ->
+                    {'error', 'timeout'}
+            after TimeoutMs ->
+                    erlang:demonitor(MonitorRef, ['flush']),
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            erlang:demonitor(MonitorRef, ['flush']),
+            {'error', 'timeout'}
+    end.
+
 -spec notify_lifecycle_guardian(pid(), pid(), pid()) -> 'ok'.
 notify_lifecycle_guardian(Parent, Parent, _GuardianPid) ->
     'ok';
@@ -822,8 +961,17 @@ notify_lifecycle_guardian(LifecycleOwner, Parent, GuardianPid) ->
 
 -spec notify_lifecycle_cleanup(pid(), pid(), 'undefined' | reference()) ->
           'ok'.
+notify_lifecycle_cleanup(Parent, Parent, _Ref) ->
+    'ok';
 notify_lifecycle_cleanup(LifecycleOwner, Parent, Ref) ->
     LifecycleOwner ! {'bounded_transport_cleanup', Parent, Ref},
+    'ok'.
+
+-spec notify_lifecycle_cleanup_started(pid(), pid(), request_budget()) -> 'ok'.
+notify_lifecycle_cleanup_started(Parent, Parent, _Budget) ->
+    'ok';
+notify_lifecycle_cleanup_started(LifecycleOwner, Parent, Budget) ->
+    LifecycleOwner ! {'bounded_transport_cleanup_started', Parent, Budget},
     'ok'.
 
 -ifdef(TEST).
@@ -845,6 +993,11 @@ guardian_ready_test_hook(Options) ->
     proplists:get_value(
       'bounded_guardian_ready_test_hook', Options, 'undefined').
 
+-spec guardian_started_test_hook(list()) -> 'undefined' | pid().
+guardian_started_test_hook(Options) ->
+    proplists:get_value(
+      'bounded_guardian_started_test_hook', Options, 'undefined').
+
 -spec encode_test_delay(list()) -> non_neg_integer().
 encode_test_delay(Options) ->
     case proplists:get_value('bounded_encode_test_delay_ms', Options, 0) of
@@ -862,7 +1015,9 @@ strip_test_options(Options) ->
           'bounded_upload_context_test_hook',
           proplists:delete(
             'bounded_guardian_ready_test_hook',
-            proplists:delete('bounded_encode_test_delay_ms', Options))))).
+            proplists:delete(
+              'bounded_guardian_started_test_hook',
+              proplists:delete('bounded_encode_test_delay_ms', Options)))))).
 -else.
 -spec handoff_test_hook(list()) -> 'undefined'.
 handoff_test_hook(_Options) ->
@@ -878,6 +1033,10 @@ upload_context_test_hook(_Options) ->
 
 -spec guardian_ready_test_hook(list()) -> 'undefined'.
 guardian_ready_test_hook(_Options) ->
+    'undefined'.
+
+-spec guardian_started_test_hook(list()) -> 'undefined'.
+guardian_started_test_hook(_Options) ->
     'undefined'.
 
 -spec encode_test_delay(list()) -> 0.
@@ -1033,17 +1192,19 @@ request_options(Options) ->
 remaining_timeout(#{'deadline_ms' := DeadlineMs}) ->
     DeadlineMs - erlang:monotonic_time('millisecond').
 
--spec close_request(reference()) -> 'ok'.
+-spec close_request(reference()) ->
+          'ok' | {'error', 'transport_cleanup_timeout'}.
 close_request(Ref) ->
     case erase({'bounded_request_owner', Ref}) of
-        {LeasePid, Budget} ->
+        {LeasePid, GuardianPid, Budget} ->
             exit(LeasePid, 'kill'),
-            require_request_cleanup(Ref, cleanup_deadline(Budget)),
-            flush_response_messages(Ref);
+            CleanupResult = request_guardian_cleanup_complete(
+                              GuardianPid, Ref, Budget),
+            flush_response_messages(Ref),
+            CleanupResult;
         'undefined' ->
             close_unowned_request(Ref)
-    end,
-    'ok'.
+    end.
 
 -spec close_unowned_request(reference()) -> 'ok'.
 close_unowned_request(Ref) ->

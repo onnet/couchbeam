@@ -111,7 +111,9 @@ bounded_view_result(Result) ->
 
 -spec collect_bounded_view_results(reference(), pid(), reference(),
                                    couchbeam_httpc:request_budget(),
-                                   [ejson_object()], 'undefined' | pid()) ->
+                                   [ejson_object()],
+                                   'undefined' | pid() | 'complete' |
+                                   {'pending', couchbeam_httpc:request_budget()}) ->
           {'ok', [ejson_object()], non_neg_integer()} |
           {'error', term()} | {'error', term(), [ejson_object()]}.
 collect_bounded_view_results(Ref, StreamPid, MonitorRef,
@@ -121,8 +123,8 @@ collect_bounded_view_results(Ref, StreamPid, MonitorRef,
         TimeoutMs when TimeoutMs > 0 ->
             receive
                 {Ref, {'done', Bytes}} ->
-                    bounded_view_terminal(
-                      Ref, MonitorRef,
+                    bounded_view_terminal_after_cleanup(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
                       {'ok', lists:reverse(Acc), Bytes});
                 {Ref, {'row', Row}} ->
                     collect_bounded_view_results(
@@ -132,78 +134,192 @@ collect_bounded_view_results(Ref, StreamPid, MonitorRef,
                     collect_bounded_view_results(
                       Ref, StreamPid, MonitorRef, Budget, Acc,
                       NewGuardianPid);
+                {'bounded_transport_cleanup', StreamPid, _ClientRef} ->
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, Acc, 'complete');
+                {'bounded_transport_cleanup_started', StreamPid,
+                 CleanupBudget} ->
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, Acc,
+                      {'pending', CleanupBudget});
                 {Ref, {'error', Error}} when Acc =:= [] ->
-                    bounded_view_terminal(
-                      Ref, MonitorRef, {'error', Error});
+                    bounded_view_terminal_after_cleanup(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
+                      {'error', Error});
                 {Ref, {'error', Error}} ->
-                    bounded_view_terminal(
-                      Ref, MonitorRef,
+                    bounded_view_terminal_after_cleanup(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
                       {'error', Error, lists:reverse(Acc)});
                 {'DOWN', MonitorRef, 'process', StreamPid, Reason} ->
-                    await_stream_transport_cleanup(
-                      StreamPid, GuardianPid, Budget),
-                    flush_view_messages(Ref),
-                    {'error', {'stream_down', Reason}}
+                    bounded_view_terminal_after_cleanup(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
+                      {'error', {'stream_down', Reason}})
             after TimeoutMs ->
-                    bounded_view_timeout(Ref, StreamPid, MonitorRef)
+                    bounded_view_timeout(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget)
             end;
         _ ->
-            bounded_view_timeout(Ref, StreamPid, MonitorRef)
+            bounded_view_timeout(
+              Ref, StreamPid, MonitorRef, GuardianPid, Budget)
     end.
 
 -spec await_stream_transport_cleanup(
-        pid(), 'undefined' | pid(), couchbeam_httpc:request_budget()) -> 'ok'.
+        pid(), 'undefined' | pid() | 'complete' |
+        {'pending', couchbeam_httpc:request_budget()},
+        couchbeam_httpc:request_budget()) ->
+          'ok' | {'error', 'transport_cleanup_timeout'}.
+await_stream_transport_cleanup(_StreamPid, 'complete', _Budget) ->
+    'ok';
+await_stream_transport_cleanup(StreamPid, {'pending', CleanupBudget},
+                               _Budget) ->
+    await_stream_transport_cleanup_pending(StreamPid, CleanupBudget);
 await_stream_transport_cleanup(StreamPid, 'undefined', Budget) ->
     case bounded_remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
             receive
                 {'bounded_transport_guardian', StreamPid, GuardianPid} ->
                     await_stream_transport_cleanup(
-                      StreamPid, GuardianPid, Budget)
+                      StreamPid, GuardianPid, Budget);
+                {'bounded_transport_cleanup_started', StreamPid,
+                 CleanupBudget} ->
+                    await_stream_transport_cleanup_pending(
+                      StreamPid, CleanupBudget);
+                {'bounded_transport_cleanup', StreamPid, _Ref} -> 'ok'
             after TimeoutMs ->
-                    'ok'
+                    {'error', 'transport_cleanup_timeout'}
             end;
         _ ->
-            'ok'
+            {'error', 'transport_cleanup_timeout'}
     end;
 await_stream_transport_cleanup(StreamPid, _GuardianPid, Budget) ->
     case bounded_remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
             receive
+                {'bounded_transport_cleanup_started', StreamPid,
+                 CleanupBudget} ->
+                    await_stream_transport_cleanup_pending(
+                      StreamPid, CleanupBudget);
                 {'bounded_transport_cleanup', StreamPid, _Ref} -> 'ok'
             after TimeoutMs ->
-                    exit({'transport_cleanup_timeout', StreamPid})
+                    {'error', 'transport_cleanup_timeout'}
             end;
         _ ->
-            exit({'transport_cleanup_timeout', StreamPid})
+            {'error', 'transport_cleanup_timeout'}
+    end.
+
+-spec await_stream_transport_cleanup_pending(
+        pid(), couchbeam_httpc:request_budget()) ->
+          'ok' | {'error', 'transport_cleanup_timeout'}.
+await_stream_transport_cleanup_pending(StreamPid, Budget) ->
+    case bounded_remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'bounded_transport_cleanup', StreamPid, _Ref} -> 'ok'
+            after TimeoutMs ->
+                    {'error', 'transport_cleanup_timeout'}
+            end;
+        _ ->
+            {'error', 'transport_cleanup_timeout'}
     end.
 
 -spec bounded_remaining_timeout(couchbeam_httpc:request_budget()) -> integer().
 bounded_remaining_timeout(#{'deadline_ms' := DeadlineMs}) ->
     DeadlineMs - erlang:monotonic_time('millisecond').
 
--spec bounded_view_timeout(reference(), pid(), reference()) ->
+-spec bounded_view_timeout(reference(), pid(), reference(),
+                           'undefined' | pid() | 'complete' |
+                           {'pending', couchbeam_httpc:request_budget()},
+                           couchbeam_httpc:request_budget()) ->
           {'error', term()}.
-bounded_view_timeout(Ref, StreamPid, MonitorRef) ->
+bounded_view_timeout(Ref, StreamPid, MonitorRef, GuardianState, Budget) ->
     StreamPid ! {Ref, 'budget_timeout'},
-    await_bounded_view_cancel(Ref, StreamPid, MonitorRef).
+    await_bounded_view_cancel(
+      Ref, StreamPid, MonitorRef, GuardianState,
+      bounded_cleanup_budget(Budget), 'undefined').
 
--spec await_bounded_view_cancel(reference(), pid(), reference()) ->
+-spec await_bounded_view_cancel(reference(), pid(), reference(),
+                                'undefined' | pid() | 'complete' |
+                                {'pending', couchbeam_httpc:request_budget()},
+                                couchbeam_httpc:request_budget(),
+                                'undefined' | {'error', term()}) ->
           {'error', term()}.
-await_bounded_view_cancel(Ref, StreamPid, MonitorRef) ->
-    receive
-        {Ref, {'row', _Row}} ->
-            await_bounded_view_cancel(Ref, StreamPid, MonitorRef);
-        {Ref, {'done', _Bytes}} ->
+await_bounded_view_cancel(Ref, _StreamPid, MonitorRef, 'complete', _Budget,
+                          {'error', _}=Result) ->
+    bounded_view_terminal(Ref, MonitorRef, Result);
+await_bounded_view_cancel(Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                          Result) ->
+    WaitBudget = bounded_cleanup_wait_budget(GuardianState, Budget),
+    case bounded_remaining_timeout(WaitBudget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Ref, {'row', _Row}} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                      Result);
+                {'bounded_transport_guardian', StreamPid, GuardianPid} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
+                      Result);
+                {'bounded_transport_cleanup', StreamPid, _ClientRef} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, 'complete', Budget,
+                      Result);
+                {'bounded_transport_cleanup_started', StreamPid,
+                 CleanupBudget} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef,
+                      {'pending', CleanupBudget}, Budget, Result);
+                {Ref, {'done', _Bytes}} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                      {'error', 'timeout'});
+                {Ref, {'error', Error}} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                      {'error', Error});
+                {'DOWN', MonitorRef, 'process', StreamPid, _Reason} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                      {'error', 'timeout'})
+            after TimeoutMs ->
+                    bounded_view_terminal(
+                      Ref, MonitorRef,
+                      {'error', 'transport_cleanup_timeout'})
+            end;
+        _ ->
             bounded_view_terminal(
-              Ref, MonitorRef, {'error', 'timeout'});
-        {Ref, {'error', Error}} ->
-            bounded_view_terminal(
-              Ref, MonitorRef, {'error', Error});
-        {'DOWN', MonitorRef, 'process', StreamPid, _Reason} ->
-            flush_view_messages(Ref),
-            {'error', 'timeout'}
+              Ref, MonitorRef, {'error', 'transport_cleanup_timeout'})
     end.
+
+-spec bounded_view_terminal_after_cleanup(
+        reference(), pid(), reference(),
+        'undefined' | pid() | 'complete' |
+        {'pending', couchbeam_httpc:request_budget()},
+        couchbeam_httpc:request_budget(), term()) -> term().
+bounded_view_terminal_after_cleanup(Ref, StreamPid, MonitorRef, GuardianState,
+                                    Budget, Result) ->
+    CleanupBudget = bounded_cleanup_budget(Budget),
+    case await_stream_transport_cleanup(
+           StreamPid, GuardianState, CleanupBudget) of
+        'ok' -> bounded_view_terminal(Ref, MonitorRef, Result);
+        {'error', 'transport_cleanup_timeout'}=Error ->
+            bounded_view_terminal(Ref, MonitorRef, Error)
+    end.
+
+-spec bounded_cleanup_budget(couchbeam_httpc:request_budget()) ->
+          couchbeam_httpc:request_budget().
+bounded_cleanup_budget(#{'timeout_ms' := TimeoutMs}=Budget) ->
+    Budget#{'deadline_ms' =>
+                erlang:monotonic_time('millisecond') + TimeoutMs}.
+
+-spec bounded_cleanup_wait_budget(
+        'undefined' | pid() | 'complete' |
+        {'pending', couchbeam_httpc:request_budget()},
+        couchbeam_httpc:request_budget()) -> couchbeam_httpc:request_budget().
+bounded_cleanup_wait_budget({'pending', CleanupBudget}, _FallbackBudget) ->
+    CleanupBudget;
+bounded_cleanup_wait_budget(_CleanupState, FallbackBudget) ->
+    FallbackBudget.
 
 -spec bounded_view_terminal(reference(), reference(), term()) -> term().
 bounded_view_terminal(Ref, MonitorRef, Result) ->

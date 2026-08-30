@@ -116,8 +116,7 @@ do_init_stream({#db{options=Opts}, Url, Args},
                     %% parent exited there is no need to continue
                     exit(normal);
                 {StreamRef, 'budget_timeout'} ->
-                    maybe_cancel_request(Ref, Budget),
-                    {'error', 'timeout'};
+                    cancel_result(Ref, Budget, {'error', 'timeout'});
                 {hackney_response, Ref, {status, 200, _}} ->
                     #state{parent=Parent,
                            ref=StreamRef,
@@ -131,19 +130,21 @@ do_init_stream({#db{options=Opts}, Url, Args},
                                      decoder=DecoderFun}};
 
                 {hackney_response, Ref, {status, 404, _}} ->
-                    maybe_cancel_request(Ref, Budget),
-                    {error, not_found};
+                    cancel_result(Ref, Budget, {error, not_found});
                 {hackney_response, Ref, {status, Status, Reason}} ->
-                    maybe_cancel_request(Ref, Budget),
-                    {error, {http_error, Status, Reason}};
+                    cancel_result(
+                      Ref, Budget, {error, {http_error, Status, Reason}});
                 {hackney_response, Ref, {error, Reason}} ->
-                    maybe_cancel_request(Ref, Budget),
-                    {error, Reason}
+                    cancel_result(Ref, Budget, {error, Reason})
             after Timeout ->
-                    maybe_cancel_request(Ref, Budget),
-                    {'error', 'timeout'}
+                    cancel_result(Ref, Budget, {'error', 'timeout'})
             end;
+        {'error', 'transport_cleanup_timeout'}=Error
+          when Budget =/= 'undefined' ->
+            Error;
         {'error', _}=Error when Budget =/= 'undefined' ->
+            LifecycleOwner ! {'bounded_transport_cleanup', self(),
+                              'undefined'},
             Error;
         Error ->
             {error, Error}
@@ -203,9 +204,13 @@ finish_stream(State) ->
 -spec complete_stream(#state{}) -> 'ok'.
 complete_stream(#state{owner=Owner, ref=StreamRef,
                        client_ref=ClientRef, budget=Budget}=State) ->
-    maybe_cancel_request(ClientRef, Budget),
+    CleanupResult = maybe_cancel_request(ClientRef, Budget),
     ets:delete(couchbeam_view_streams, StreamRef),
-    Owner ! done_message(State),
+    case CleanupResult of
+        'ok' -> Owner ! done_message(State);
+        {'error', 'transport_cleanup_timeout'} ->
+            report_error('transport_cleanup_timeout', StreamRef, Owner)
+    end,
     'ok'.
 
 decode_data(Data, #state{owner=Owner,
@@ -464,9 +469,13 @@ add_response_bytes(Data, #state{budget=Budget,
 -spec fail_stream(term(), #state{}) -> no_return().
 fail_stream(Reason, #state{owner=Owner, ref=StreamRef,
                            client_ref=ClientRef}) ->
-    couchbeam_httpc:cancel_request(ClientRef),
+    CleanupResult = couchbeam_httpc:cancel_request(ClientRef),
     ets:delete(couchbeam_view_streams, StreamRef),
-    report_error(Reason, StreamRef, Owner),
+    case CleanupResult of
+        'ok' -> report_error(Reason, StreamRef, Owner);
+        {'error', 'transport_cleanup_timeout'} ->
+            report_error('transport_cleanup_timeout', StreamRef, Owner)
+    end,
     exit('normal').
 
 -spec fail_or_report_stream(term(), #state{}) -> no_return().
@@ -480,11 +489,19 @@ fail_or_report_stream(Error, State) ->
 
 -spec maybe_cancel_request(reference(),
                            'undefined' | couchbeam_httpc:request_budget()) ->
-          'ok'.
+          'ok' | {'error', 'transport_cleanup_timeout'}.
 maybe_cancel_request(_Ref, 'undefined') ->
     'ok';
 maybe_cancel_request(Ref, _Budget) ->
     couchbeam_httpc:cancel_request(Ref).
+
+-spec cancel_result(reference(), couchbeam_httpc:request_budget(), term()) ->
+          term().
+cancel_result(Ref, Budget, Result) ->
+    case maybe_cancel_request(Ref, Budget) of
+        'ok' -> Result;
+        {'error', 'transport_cleanup_timeout'}=Error -> Error
+    end.
 
 -spec done_message(#state{}) ->
           {reference(), 'done' | {'done', non_neg_integer()}}.
@@ -776,7 +793,7 @@ maybe_continue_decoding(#viewst{parent=Parent,
 
 -spec close_view_request(reference(),
                          'undefined' | couchbeam_httpc:request_budget()) ->
-          'ok'.
+          'ok' | {'error', 'transport_cleanup_timeout'}.
 close_view_request(ClientRef, 'undefined') ->
     hackney:close(ClientRef);
 close_view_request(ClientRef, _Budget) ->
@@ -793,9 +810,13 @@ close_view_after_owner_down(ClientRef, Budget) ->
                                 couchbeam_httpc:request_budget(), pid()) ->
           no_return().
 fail_view_decoder_timeout(Ref, ClientRef, Budget, Owner) ->
-    close_view_request(ClientRef, Budget),
+    CleanupResult = close_view_request(ClientRef, Budget),
     ets:delete(couchbeam_view_streams, Ref),
-    report_error('timeout', Ref, Owner),
+    case CleanupResult of
+        'ok' -> report_error('timeout', Ref, Owner);
+        {'error', 'transport_cleanup_timeout'} ->
+            report_error('transport_cleanup_timeout', Ref, Owner)
+    end,
     exit('normal').
 
 report_error({error, _What}=Error, Ref, Pid) ->
