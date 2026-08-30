@@ -100,10 +100,16 @@ bounded_view_closes_oversized_raw_stream_test() ->
 bounded_view_returns_raw_bytes_for_cumulative_budget_test() ->
     {'ok', _} = application:ensure_all_started('hackney'),
     ensure_couchbeam_supervisor(),
-    Body = <<"{\"total_rows\":1,\"offset\":0,\"rows\":[{\"id\":\"doc\",\"key\":\"doc\",\"value\":{}}]}">>,
+    FirstChunk = <<"{\"total_rows\":1,\"offset\":0,\"rows\":[">>,
+    SecondChunk = <<"{\"id\":\"doc\",\"key\":\"doc\",\"value\":{}}]}">>,
+    BodySize = byte_size(FirstChunk) + byte_size(SecondChunk),
     with_http_server(
       fun(Socket, Parent) ->
-              send_json_response(Socket, Body),
+              'ok' = send_chunked_headers(Socket),
+              'ok' = send_http_chunk(Socket, FirstChunk),
+              timer:sleep(10),
+              'ok' = send_http_chunk(Socket, SecondChunk),
+              'ok' = send_http_chunk(Socket, <<>>),
               Parent ! {'server_done', self()}
       end,
       fun(BaseUrl) ->
@@ -114,7 +120,7 @@ bounded_view_returns_raw_bytes_for_cumulative_budget_test() ->
                               {<<"key">>, <<"doc">>},
                               {<<"value">>, {[]}}]},
               ?assertEqual(
-                 {'ok', [ExpectedRow], byte_size(Body)},
+                 {'ok', [ExpectedRow], BodySize},
                  couchbeam_view:fetch_bounded(
                    Db, 'all_docs', [], {1000, 1024}))
       end).
@@ -357,6 +363,38 @@ legacy_view_fetch_result_shape_unchanged_test() ->
                  {'ok', [ExpectedRow]},
                  couchbeam_view:fetch(Db, 'all_docs', []))
       end).
+
+legacy_view_stream_allows_long_interchunk_pause_test_() ->
+    {timeout, 15,
+     fun() ->
+             {'ok', _} = application:ensure_all_started('hackney'),
+             ensure_couchbeam_supervisor(),
+             Prefix = <<"{\"total_rows\":1,\"offset\":0,\"rows\":[">>,
+             Suffix = <<"{\"id\":\"doc\",\"key\":\"doc\",\"value\":{}}]}">>,
+             BodySize = byte_size(Prefix) + byte_size(Suffix),
+             with_http_server(
+               fun(Socket, Parent) ->
+                       'ok' = send_json_headers(Socket, BodySize),
+                       'ok' = gen_tcp:send(Socket, Prefix),
+                       timer:sleep(10200),
+                       'ok' = gen_tcp:send(Socket, Suffix),
+                       Parent ! {'server_done', self()}
+               end,
+               fun(BaseUrl) ->
+                       Server = couchbeam:server_connection(
+                                  BaseUrl, [{'no_proxy_env', 'true'},
+                                            {'recv_timeout', 15000}]),
+                       {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+                       ExpectedRow = {[{<<"id">>, <<"doc">>},
+                                       {<<"key">>, <<"doc">>},
+                                       {<<"value">>, {[]}}]},
+                       {'ok', Ref} = couchbeam_view:stream(
+                                       Db, 'all_docs', []),
+                       ?assertEqual(
+                          {'ok', [ExpectedRow]},
+                          collect_legacy_stream(Ref, []))
+               end)
+     end}.
 
 bounded_open_doc_cancels_slow_headers_at_absolute_deadline_test() ->
     assert_slow_header_deadline(
@@ -1579,6 +1617,18 @@ send_chunked_headers(Socket) ->
 send_http_chunk(Socket, Chunk) ->
     Size = integer_to_binary(byte_size(Chunk), 16),
     gen_tcp:send(Socket, [Size, <<"\r\n">>, Chunk, <<"\r\n">>]).
+
+collect_legacy_stream(Ref, Acc) ->
+    receive
+        {Ref, 'done'} ->
+            {'ok', lists:reverse(Acc)};
+        {Ref, {'row', Row}} ->
+            collect_legacy_stream(Ref, [Row | Acc]);
+        {Ref, {'error', Error}} ->
+            {'error', Error}
+    after 15000 ->
+            {'error', 'test_timeout'}
+    end.
 
 recv_until_closed(Socket) ->
     case gen_tcp:recv(Socket, 0, 1000) of

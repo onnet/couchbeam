@@ -165,6 +165,28 @@ loop(#state{owner=Owner,
 
 -spec loop_receive(#state{}, pid(), reference(), reference(), reference()) ->
           'ok' | no_return().
+loop_receive(#state{budget='undefined'}=State, _Owner, StreamRef, MRef,
+             ClientRef) ->
+    hackney:stream_next(ClientRef),
+    receive
+        {'DOWN', MRef, _, _, _} ->
+            %% parent exited there is no need to continue
+            maybe_close_after_owner_down(State),
+            exit(normal);
+        {StreamRef, 'budget_timeout'} ->
+            fail_stream('timeout', State);
+        {hackney_response, ClientRef, {headers, _Headers}} ->
+            loop(State);
+        {hackney_response, ClientRef, done} ->
+            finish_stream(State);
+        {hackney_response, ClientRef, Data} when is_binary(Data) ->
+            case add_response_bytes(Data, State) of
+                {'ok', State1} -> decode_data(Data, State1);
+                {'error', Reason} -> fail_stream(Reason, State)
+            end;
+        {hackney_response, ClientRef, Error} ->
+            fail_or_report_stream(Error, State)
+    end;
 loop_receive(State, _Owner, StreamRef, MRef, ClientRef) ->
     hackney:stream_next(ClientRef),
     Timeout = receive_timeout(State),
