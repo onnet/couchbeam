@@ -1528,6 +1528,7 @@ with_http_server(ServerFun, ClientFun) ->
                                       {'ok', _Request} -> ServerFun(Socket, Parent);
                                       _ -> 'ok'
                                   end,
+                                  _ = gen_tcp:shutdown(Socket, 'write'),
                                   gen_tcp:close(Socket);
                               _ ->
                                   'ok'
