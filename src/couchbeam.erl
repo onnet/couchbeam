@@ -22,10 +22,13 @@
          open_or_create_db/2, open_or_create_db/3, open_or_create_db/4,
          delete_db/1, delete_db/2,
          db_info/1,
+         db_info_bounded/2,
          design_info/2, view_cleanup/1,
          save_doc/2, save_doc/3, save_doc/4,
+         save_doc_bounded/4,
          doc_exists/2,
          open_doc/2, open_doc/3,
+         open_doc_bounded/4,
          stream_doc/1, end_doc_stream/1,
          delete_doc/2, delete_doc/3,
          save_docs/2, save_docs/3,
@@ -393,6 +396,28 @@ db_info(#db{server=Server, name=DbName, options=Opts}) ->
           Error
     end.
 
+-spec db_info_bounded(db(), couchbeam_httpc:request_budget_spec()) ->
+          {'ok', ejson_object(), non_neg_integer()} | {'error', term()}.
+db_info_bounded(#db{server=Server, name=DbName, options=Opts}, BudgetSpec) ->
+    case couchbeam_httpc:new_request_budget(BudgetSpec) of
+        {'ok', Budget} ->
+            Url = hackney_url:make_url(
+                    couchbeam_httpc:server_url(Server),
+                    couchbeam_util:dbname(DbName), []),
+            Options = [{'request_budget', Budget} | Opts],
+            case couchbeam_httpc:db_request('get', Url, [], <<>>, Options,
+                                            [200]) of
+                {'ok', _Status, _Headers, Ref} ->
+                    couchbeam_httpc:bounded_json_body(Ref, Budget);
+                {'error', 'not_found'} ->
+                    {'error', 'db_not_found'};
+                Error ->
+                    Error
+            end;
+        {'error', _}=Error ->
+            Error
+    end.
+
 %% @doc test if doc with uuid exists in the given db
 %% @spec doc_exists(db(), string()) -> boolean()
 doc_exists(#db{server=Server, options=Opts}=Db, DocId) ->
@@ -451,6 +476,30 @@ open_doc(#db{server=Server, options=Opts}=Db, DocId, Params) ->
             Error
     end.
 
+-spec open_doc_bounded(db(), docid(), list(),
+                       couchbeam_httpc:request_budget_spec()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+open_doc_bounded(#db{server=Server, options=Opts}=Db,
+                 DocId, Params, BudgetSpec) ->
+    case couchbeam_httpc:new_request_budget(BudgetSpec) of
+        {'ok', Budget} ->
+            DocId1 = couchbeam_util:encode_docid(DocId),
+            Url = hackney_url:make_url(
+                    couchbeam_httpc:server_url(Server),
+                    couchbeam_httpc:doc_url(Db, DocId1),
+                    Params),
+            Options = [{'request_budget', Budget} | Opts],
+            case couchbeam_httpc:db_request('get', Url, [], <<>>, Options,
+                                            [200, 201]) of
+                {'ok', _, _, Ref} ->
+                    couchbeam_httpc:bounded_json_body(Ref, Budget);
+                Error ->
+                    Error
+            end;
+        {'error', _}=Error ->
+            Error
+    end.
+
 %% @doc stream the multipart response of the doc API. Use this function
 %% when you get `{ok, {multipart, State}}' from the function
 %% `couchbeam:open_doc/3'.
@@ -491,6 +540,49 @@ save_doc(Db, Doc) ->
 %% @spec save_doc(Db::db(), Doc, Options::list()) -> {ok, Doc1}|{error, Error}
 save_doc(Db, Doc, Options) ->
     save_doc(Db, Doc, [], Options).
+
+-spec save_doc_bounded(db(), doc(), list(),
+                       couchbeam_httpc:request_budget_spec()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+save_doc_bounded(#db{server=Server, options=Opts}=Db,
+                 {Props}=Doc, Options, BudgetSpec) ->
+    case {couchbeam_util:get_value(<<"_id">>, Props),
+          couchbeam_httpc:new_request_budget(BudgetSpec)} of
+        {'undefined', _} ->
+            {'error', 'missing_doc_id'};
+        {_DocId, {'error', _}=Error} ->
+            Error;
+        {DocId, {'ok', Budget}} ->
+            EncodedDocId = couchbeam_util:encode_docid(DocId),
+            Url = hackney_url:make_url(
+                    couchbeam_httpc:server_url(Server),
+                    couchbeam_httpc:doc_url(Db, EncodedDocId), Options),
+            Headers = [{<<"Content-Type">>, <<"application/json">>}],
+            RequestOptions = [{'request_budget', Budget} | Opts],
+            case couchbeam_httpc:db_request(
+                   'put', Url, Headers, couchbeam_ejson:encode(Doc),
+                   RequestOptions, [200, 201, 202]) of
+                {'ok', _, _, Ref} ->
+                    bounded_saved_doc(Ref, Budget, Doc);
+                Error ->
+                    Error
+            end
+    end.
+
+-spec bounded_saved_doc(reference(), couchbeam_httpc:request_budget(), doc()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+bounded_saved_doc(Ref, Budget, Doc) ->
+    case couchbeam_httpc:bounded_json_body(Ref, Budget) of
+        {'ok', {JsonProp}, Bytes} ->
+            NewRev = couchbeam_util:get_value(<<"rev">>, JsonProp),
+            NewDocId = couchbeam_util:get_value(<<"id">>, JsonProp),
+            Doc1 = couchbeam_doc:set_value(
+                     <<"_rev">>, NewRev,
+                     couchbeam_doc:set_value(<<"_id">>, NewDocId, Doc)),
+            {'ok', Doc1, Bytes};
+        {'error', _}=Error ->
+            Error
+    end.
 
 
 %% @doc save a *document with all its attacjments

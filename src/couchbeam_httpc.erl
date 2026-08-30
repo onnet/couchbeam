@@ -8,9 +8,13 @@
 -export([request/5,
          db_request/5, db_request/6,
          json_body/1,
+         bounded_json_body/2,
+         new_request_budget/1,
+         cancel_request/1,
          db_resp/2,
          make_headers/4,
          maybe_oauth_header/4]).
+-export_type([request_budget_spec/0, request_budget/0]).
 %% urls utils
 -export([server_url/1, db_url/1, doc_url/2]).
 %% atts utols
@@ -18,22 +22,202 @@
 
 -include("couchbeam.hrl").
 
-request(Method, Url, Headers, Body, Options) ->
-    {FinalHeaders, FinalOpts} = make_headers(Method, Url, Headers,
-                                             Options),
+-type request_budget_spec() :: {pos_integer(), pos_integer()}.
+-type request_budget() :: #{'deadline_ms' := integer(),
+                            'max_response_bytes' := pos_integer()}.
 
-    hackney:request(Method, Url , FinalHeaders, Body, FinalOpts).
+request(Method, Url, Headers, Body, Options) ->
+    {FinalHeaders, FinalOpts0} = make_headers(Method, Url, Headers,
+                                              Options),
+    case request_options(FinalOpts0) of
+        {'ok', FinalOpts} ->
+            hackney:request(Method, Url , FinalHeaders, Body, FinalOpts);
+        {'error', _}=Error ->
+            Error
+    end.
 
 db_request(Method, Url, Headers, Body, Options) ->
     db_request(Method, Url, Headers, Body, Options, []).
 
 db_request(Method, Url, Headers, Body, Options, Expect) ->
     Resp = request(Method, Url, Headers, Body, Options),
-    db_resp(Resp, Expect).
+    case couchbeam_util:get_value('request_budget', Options) of
+        #{'deadline_ms' := _, 'max_response_bytes' := _}=Budget ->
+            db_resp_bounded(Resp, Expect, Budget);
+        _ ->
+            db_resp(Resp, Expect)
+    end.
 
 json_body(Ref) ->
     {ok, Body} = hackney:body(Ref),
     couchbeam_ejson:decode(Body).
+
+-spec new_request_budget(request_budget_spec()) ->
+          {'ok', request_budget()} | {'error', 'invalid_request_budget'}.
+new_request_budget({TimeoutMs, MaxResponseBytes})
+  when is_integer(TimeoutMs), TimeoutMs > 0,
+       is_integer(MaxResponseBytes), MaxResponseBytes > 0 ->
+    {'ok', #{'deadline_ms' => erlang:monotonic_time('millisecond') + TimeoutMs,
+             'max_response_bytes' => MaxResponseBytes}};
+new_request_budget(_) ->
+    {'error', 'invalid_request_budget'}.
+
+-spec bounded_json_body(reference(), request_budget()) ->
+          {'ok', term(), non_neg_integer()} |
+          {'error', 'timeout' | 'response_too_large' |
+                    'invalid_request_budget' | term()}.
+bounded_json_body(Ref, #{'deadline_ms' := _,
+                         'max_response_bytes' := _}=Budget) ->
+    case bounded_binary_body(Ref, Budget) of
+        {'ok', Body, Bytes} -> decode_bounded_json(Body, Bytes);
+        {'error', _}=Error -> Error
+    end;
+bounded_json_body(Ref, _) ->
+    close_request(Ref),
+    {'error', 'invalid_request_budget'}.
+
+-spec cancel_request(reference()) -> 'ok'.
+cancel_request(Ref) ->
+    close_request(Ref).
+
+-spec bounded_binary_body(reference(), request_budget()) ->
+          {'ok', binary(), non_neg_integer()} | {'error', term()}.
+bounded_binary_body(Ref, Budget) ->
+    bounded_body(Ref, Budget, <<>>, 0).
+
+-spec bounded_body(reference(), request_budget(), binary(), non_neg_integer()) ->
+          {'ok', binary(), non_neg_integer()} | {'error', term()}.
+bounded_body(Ref, Budget, Acc, Bytes) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            _ = hackney:setopts(Ref, [{'recv_timeout', TimeoutMs}]),
+            bounded_body_chunk(hackney:stream_body(Ref), Ref,
+                               Budget, Acc, Bytes);
+        _ ->
+            close_request(Ref),
+            {'error', 'timeout'}
+    end.
+
+-spec bounded_body_chunk(term(), reference(), request_budget(), binary(),
+                         non_neg_integer()) ->
+          {'ok', binary(), non_neg_integer()} | {'error', term()}.
+bounded_body_chunk({'ok', Chunk}, Ref,
+                   #{'max_response_bytes' := MaxBytes}=Budget, Acc, Bytes) ->
+    NewBytes = Bytes + byte_size(Chunk),
+    case NewBytes =< MaxBytes of
+        'true' -> bounded_body(Ref, Budget, <<Acc/binary, Chunk/binary>>, NewBytes);
+        'false' ->
+            close_request(Ref),
+            {'error', 'response_too_large'}
+    end;
+bounded_body_chunk('done', Ref, Budget, Acc, Bytes) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 -> {'ok', Acc, Bytes};
+        _ ->
+            close_request(Ref),
+            {'error', 'timeout'}
+    end;
+bounded_body_chunk({'error', 'timeout'}, Ref, _Budget, _Acc, _Bytes) ->
+    close_request(Ref),
+    {'error', 'timeout'};
+bounded_body_chunk({'error', Reason}, Ref, _Budget, _Acc, _Bytes) ->
+    close_request(Ref),
+    {'error', Reason}.
+
+-spec decode_bounded_json(binary(), non_neg_integer()) ->
+          {'ok', term(), non_neg_integer()} | {'error', term()}.
+decode_bounded_json(Body, Bytes) ->
+    try couchbeam_ejson:decode(Body) of
+        Json -> {'ok', Json, Bytes}
+    catch
+        'error':Reason -> {'error', {'invalid_json', Reason}}
+    end.
+
+-spec request_options(list()) -> {'ok', list()} | {'error', term()}.
+request_options(Options) ->
+    case couchbeam_util:get_value('request_budget', Options) of
+        'undefined' ->
+            {'ok', Options};
+        #{'deadline_ms' := _, 'max_response_bytes' := _}=Budget ->
+            case remaining_timeout(Budget) of
+                TimeoutMs when TimeoutMs > 0 ->
+                    Options1 = proplists:delete('request_budget', Options),
+                    {'ok', [{'connect_timeout', TimeoutMs},
+                            {'recv_timeout', TimeoutMs}
+                            | proplists:delete('connect_timeout',
+                                               proplists:delete('recv_timeout',
+                                                                Options1))]};
+                _ ->
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            {'error', 'invalid_request_budget'}
+    end.
+
+-spec remaining_timeout(request_budget()) -> integer().
+remaining_timeout(#{'deadline_ms' := DeadlineMs}) ->
+    DeadlineMs - erlang:monotonic_time('millisecond').
+
+-spec close_request(reference()) -> 'ok'.
+close_request(Ref) ->
+    case catch hackney:cancel_request(Ref) of
+        {'ok', {Transport, Socket, _Buffer, _ResponseState}}
+          when Socket =/= 'nil' ->
+            _ = catch Transport:close(Socket),
+            'ok';
+        _ ->
+            _ = catch hackney:close(Ref),
+            'ok'
+    end,
+    'ok'.
+
+-spec db_resp_bounded(term(), [integer()], request_budget()) -> term().
+db_resp_bounded({'ok', Ref}=Resp, _Expect, _Budget) when is_reference(Ref) ->
+    Resp;
+db_resp_bounded({'ok', 401, _}, _Expect, _Budget) ->
+    {'error', 'unauthenticated'};
+db_resp_bounded({'ok', 403, _}, _Expect, _Budget) ->
+    {'error', 'forbidden'};
+db_resp_bounded({'ok', 404, _}, _Expect, _Budget) ->
+    {'error', 'not_found'};
+db_resp_bounded({'ok', 409, _}, _Expect, _Budget) ->
+    {'error', 'conflict'};
+db_resp_bounded({'ok', 412, _}, _Expect, _Budget) ->
+    {'error', 'precondition_failed'};
+db_resp_bounded({'ok', _, _}=Resp, [], _Budget) ->
+    Resp;
+db_resp_bounded({'ok', Status, Headers}=Resp, Expect, _Budget) ->
+    case lists:member(Status, Expect) of
+        'true' -> Resp;
+        'false' -> {'error', {'bad_response', {Status, Headers, <<>>}}}
+    end;
+db_resp_bounded({'ok', Status, _Headers, Ref}, _Expect, _Budget)
+  when Status =:= 401; Status =:= 403; Status =:= 404;
+       Status =:= 409; Status =:= 412 ->
+    cancel_request(Ref),
+    db_resp_bounded_status(Status);
+db_resp_bounded({'ok', _, _, _}=Resp, [], _Budget) ->
+    Resp;
+db_resp_bounded({'ok', Status, Headers, Ref}=Resp, Expect, Budget) ->
+    case lists:member(Status, Expect) of
+        'true' -> Resp;
+        'false' ->
+            case bounded_binary_body(Ref, Budget) of
+                {'ok', ErrorBody, _Bytes} ->
+                    {'error', {'bad_response', {Status, Headers, ErrorBody}}};
+                {'error', _}=Error ->
+                    Error
+            end
+    end;
+db_resp_bounded(Error, _Expect, _Budget) ->
+    Error.
+
+-spec db_resp_bounded_status(integer()) -> {'error', atom()}.
+db_resp_bounded_status(401) -> {'error', 'unauthenticated'};
+db_resp_bounded_status(403) -> {'error', 'forbidden'};
+db_resp_bounded_status(404) -> {'error', 'not_found'};
+db_resp_bounded_status(409) -> {'error', 'conflict'};
+db_resp_bounded_status(412) -> {'error', 'precondition_failed'}.
 
 make_headers(Method, Url, Headers, Options) ->
     Headers1 = case couchbeam_util:get_value(<<"Accept">>, Headers) of

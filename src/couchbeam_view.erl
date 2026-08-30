@@ -11,6 +11,7 @@
 -export([stream/2, stream/3,
          cancel_stream/1, stream_next/1,
          fetch/1, fetch/2, fetch/3,
+         fetch_bounded/4,
          count/1, count/2, count/3,
          first/1, first/2, first/3,
          all/1, all/2,
@@ -73,6 +74,109 @@ fetch(Db, ViewName, Options) ->
             Error
     end.
 
+-spec fetch_bounded(db(), 'all_docs' | {binary(), binary()}, list(),
+                    couchbeam_httpc:request_budget_spec()) ->
+          {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
+fetch_bounded(Db, ViewName, Options, BudgetSpec) ->
+    case couchbeam_httpc:new_request_budget(BudgetSpec) of
+        {'ok', Budget} ->
+            FetchOptions = bounded_fetch_options(Options),
+            case stream_with_budget(Db, ViewName, FetchOptions, Budget) of
+                {'ok', Ref, StreamPid} ->
+                    MonitorRef = erlang:monitor('process', StreamPid),
+                    bounded_view_result(
+                      collect_bounded_view_results(
+                        Ref, StreamPid, MonitorRef, Budget, []));
+                {'error', _}=Error ->
+                    Error
+            end;
+        {'error', _}=Error ->
+            Error
+    end.
+
+-spec bounded_fetch_options(list()) -> list().
+bounded_fetch_options(Options) ->
+    proplists:delete('async', proplists:delete('stream_to', Options)).
+
+-spec bounded_view_result({'ok', [ejson_object()], non_neg_integer()} |
+                          {'error', term()} |
+                          {'error', term(), [ejson_object()]}) ->
+          {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
+bounded_view_result({'error', Error, _Rows}) ->
+    {'error', Error};
+bounded_view_result(Result) ->
+    Result.
+
+-spec collect_bounded_view_results(reference(), pid(), reference(),
+                                   couchbeam_httpc:request_budget(),
+                                   [ejson_object()]) ->
+          {'ok', [ejson_object()], non_neg_integer()} |
+          {'error', term()} | {'error', term(), [ejson_object()]}.
+collect_bounded_view_results(Ref, StreamPid, MonitorRef,
+                             #{'deadline_ms' := DeadlineMs}=Budget, Acc) ->
+    case DeadlineMs - erlang:monotonic_time('millisecond') of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Ref, {'done', Bytes}} ->
+                    bounded_view_terminal(
+                      Ref, MonitorRef,
+                      {'ok', lists:reverse(Acc), Bytes});
+                {Ref, {'row', Row}} ->
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, [Row | Acc]);
+                {Ref, {'error', Error}} when Acc =:= [] ->
+                    bounded_view_terminal(
+                      Ref, MonitorRef, {'error', Error});
+                {Ref, {'error', Error}} ->
+                    bounded_view_terminal(
+                      Ref, MonitorRef,
+                      {'error', Error, lists:reverse(Acc)});
+                {'DOWN', MonitorRef, 'process', StreamPid, Reason} ->
+                    flush_view_messages(Ref),
+                    {'error', {'stream_down', Reason}}
+            after TimeoutMs ->
+                    bounded_view_timeout(Ref, StreamPid, MonitorRef)
+            end;
+        _ ->
+            bounded_view_timeout(Ref, StreamPid, MonitorRef)
+    end.
+
+-spec bounded_view_timeout(reference(), pid(), reference()) ->
+          {'error', term()}.
+bounded_view_timeout(Ref, StreamPid, MonitorRef) ->
+    StreamPid ! {Ref, 'budget_timeout'},
+    await_bounded_view_cancel(Ref, StreamPid, MonitorRef).
+
+-spec await_bounded_view_cancel(reference(), pid(), reference()) ->
+          {'error', term()}.
+await_bounded_view_cancel(Ref, StreamPid, MonitorRef) ->
+    receive
+        {Ref, {'row', _Row}} ->
+            await_bounded_view_cancel(Ref, StreamPid, MonitorRef);
+        {Ref, {'done', _Bytes}} ->
+            bounded_view_terminal(
+              Ref, MonitorRef, {'error', 'timeout'});
+        {Ref, {'error', Error}} ->
+            bounded_view_terminal(
+              Ref, MonitorRef, {'error', Error});
+        {'DOWN', MonitorRef, 'process', StreamPid, _Reason} ->
+            flush_view_messages(Ref),
+            {'error', 'timeout'}
+    end.
+
+-spec bounded_view_terminal(reference(), reference(), term()) -> term().
+bounded_view_terminal(Ref, MonitorRef, Result) ->
+    erlang:demonitor(MonitorRef, ['flush']),
+    flush_view_messages(Ref),
+    Result.
+
+-spec flush_view_messages(reference()) -> 'ok'.
+flush_view_messages(Ref) ->
+    receive
+        {Ref, _Message} -> flush_view_messages(Ref)
+    after 0 ->
+            'ok'
+    end.
 
 -spec stream(Db::db(), ViewName::'all_docs' | {DesignName::design_name(),
         ViewName::view_name()}) -> {ok, StartRef::term(),
@@ -149,25 +253,48 @@ stream(Db, ViewName) ->
 %% the view loop process. Can be used to monitor it or kill it
 %% when needed.</p>
 stream(Db, ViewName, Options) ->
+    stream_with_budget(Db, ViewName, Options, 'undefined').
+
+-spec stream_with_budget(db(), 'all_docs' | {binary(), binary()}, list(),
+                         'undefined' | couchbeam_httpc:request_budget()) ->
+          {'ok', reference()} | {'ok', reference(), pid()} | {'error', term()}.
+stream_with_budget(Db, ViewName, Options, Budget) ->
     {To, Options1} = case proplists:get_value(stream_to, Options) of
-        undefined ->
-            {self(), Options};
-        Pid ->
-            {Pid, proplists:delete(stream_to, Options)}
-    end,
+                         undefined ->
+                             {self(), Options};
+                         StreamOwner ->
+                             {StreamOwner, proplists:delete(stream_to, Options)}
+                     end,
+    StreamOptions = stream_options(Options, Budget),
     make_view(Db, ViewName, Options1, fun(Args, Url) ->
-                Ref = make_ref(),
-                Req = {Db, Url, Args},
-                case supervisor:start_child(couchbeam_view_sup, [To,
-                                                                 Ref,
-                                                                 Req,
-                                                                 Options]) of
-                    {ok, _Pid} ->
-                        {ok, Ref};
-                    Error ->
-                        Error
-                end
-        end).
+                                              Ref = make_ref(),
+                                              Req = {Db, Url, Args},
+                                              case supervisor:start_child(couchbeam_view_sup, [To,
+                                                                                               Ref,
+                                                                                               Req,
+                                                                                               StreamOptions]) of
+                                                  {'ok', ViewPid} ->
+                                                      stream_result(
+                                                        Ref, ViewPid, Budget);
+                                                  Error ->
+                                                      Error
+                                              end
+                                      end).
+
+-spec stream_result(reference(), pid(),
+                    'undefined' | couchbeam_httpc:request_budget()) ->
+          {'ok', reference()} | {'ok', reference(), pid()}.
+stream_result(Ref, _Pid, 'undefined') ->
+    {'ok', Ref};
+stream_result(Ref, Pid, _Budget) ->
+    {'ok', Ref, Pid}.
+
+-spec stream_options(list(),
+                     'undefined' | couchbeam_httpc:request_budget()) -> list().
+stream_options(Options, 'undefined') ->
+    Options;
+stream_options(Options, Budget) ->
+    [{'request_budget', Budget} | Options].
 
 
 cancel_stream(Ref) ->
