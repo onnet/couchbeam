@@ -559,12 +559,17 @@ save_doc_bounded(#db{server=Server, options=Opts}=Db,
                     couchbeam_httpc:doc_url(Db, EncodedDocId), Options),
             Headers = [{<<"Content-Type">>, <<"application/json">>}],
             RequestOptions = [{'request_budget', Budget} | Opts],
-            case couchbeam_httpc:db_request(
-                   'put', Url, Headers, couchbeam_ejson:encode(Doc),
-                   RequestOptions, [200, 201, 202]) of
-                {'ok', _, _, Ref} ->
-                    bounded_saved_doc(Ref, Budget, Doc);
-                Error ->
+            case couchbeam_httpc:bounded_encode_json(Doc, Budget, Opts) of
+                {'ok', EncodedDoc} ->
+                    case couchbeam_httpc:db_request(
+                           'put', Url, Headers, EncodedDoc,
+                           RequestOptions, [200, 201, 202]) of
+                        {'ok', _, _, Ref} ->
+                            bounded_saved_doc(Ref, Budget, Doc);
+                        Error ->
+                            Error
+                    end;
+                {'error', _}=Error ->
                     Error
             end
     end.
