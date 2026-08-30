@@ -945,6 +945,11 @@ flush_request_result(Token) ->
 -spec await_owned_transport_cleanup(pid(), request_budget()) ->
           'ok' | {'error', 'timeout'}.
 await_owned_transport_cleanup(OwnerPid, Budget) ->
+    await_owned_transport_cleanup(OwnerPid, Budget, 'false').
+
+-spec await_owned_transport_cleanup(pid(), request_budget(), boolean()) ->
+          'ok' | {'error', 'timeout'}.
+await_owned_transport_cleanup(OwnerPid, Budget, BarrierUsed) ->
     case catch ets:match_object(
                  'hackney_manager_refs', {'_', {OwnerPid, '_', '_'}}) of
         [] ->
@@ -952,28 +957,62 @@ await_owned_transport_cleanup(OwnerPid, Budget) ->
         {'EXIT', {'badarg', _}} ->
             'ok';
         [_ | _] ->
-            case remaining_timeout(Budget) of
-                Remaining when Remaining > 0 ->
-                    erlang:yield(),
-                    await_owned_transport_cleanup(OwnerPid, Budget);
-                _ ->
-                    {'error', 'timeout'}
-            end
+            await_cleanup_barrier_or_deadline(
+              fun() ->
+                      await_owned_transport_cleanup(
+                        OwnerPid, Budget, 'true')
+              end, Budget, BarrierUsed)
     end.
 
 -spec await_request_cleanup(reference(), request_budget()) ->
           'ok' | {'error', 'timeout'}.
 await_request_cleanup(Ref, Budget) ->
+    await_request_cleanup(Ref, Budget, 'false').
+
+-spec await_request_cleanup(reference(), request_budget(), boolean()) ->
+          'ok' | {'error', 'timeout'}.
+await_request_cleanup(Ref, Budget, BarrierUsed) ->
     case catch ets:lookup('hackney_manager_refs', Ref) of
         [] -> 'ok';
         {'EXIT', {'badarg', _}} -> 'ok';
         [_] ->
-            case remaining_timeout(Budget) of
-                Remaining when Remaining > 0 ->
-                    erlang:yield(),
-                    await_request_cleanup(Ref, Budget);
-                _ -> {'error', 'timeout'}
-            end
+            await_cleanup_barrier_or_deadline(
+              fun() -> await_request_cleanup(Ref, Budget, 'true') end,
+              Budget, BarrierUsed)
+    end.
+
+-spec await_cleanup_barrier_or_deadline(
+        fun(() -> 'ok' | {'error', 'timeout'}), request_budget(), boolean()) ->
+          'ok' | {'error', 'timeout'}.
+await_cleanup_barrier_or_deadline(ContinueFun, Budget, 'false') ->
+    case manager_cleanup_barrier(Budget) of
+        'ok' -> ContinueFun();
+        {'error', 'timeout'}=Error -> Error
+    end;
+await_cleanup_barrier_or_deadline(ContinueFun, Budget, 'true') ->
+    case remaining_timeout(Budget) of
+        Remaining when Remaining > 0 ->
+            receive
+            after Remaining ->
+                    ContinueFun()
+            end;
+        _ ->
+            {'error', 'timeout'}
+    end.
+
+-spec manager_cleanup_barrier(request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+manager_cleanup_barrier(Budget) ->
+    case remaining_timeout(Budget) of
+        Remaining when Remaining > 0 ->
+            try sys:get_state('hackney_manager', Remaining) of
+                _State -> 'ok'
+            catch
+                'exit':{'timeout', _} -> {'error', 'timeout'};
+                'exit':_Reason -> {'error', 'timeout'}
+            end;
+        _ ->
+            {'error', 'timeout'}
     end.
 
 -spec cleanup_deadline(request_budget()) -> request_budget().
@@ -1472,8 +1511,7 @@ db_resp_bounded({'ok', Status, Headers}=Resp, Expect, _Budget) ->
 db_resp_bounded({'ok', Status, _Headers, Ref}, _Expect, _Budget)
   when Status =:= 401; Status =:= 403; Status =:= 404;
        Status =:= 409; Status =:= 412 ->
-    cancel_request(Ref),
-    db_resp_bounded_status(Status);
+    cleanup_result(cancel_request(Ref), db_resp_bounded_status(Status));
 db_resp_bounded({'ok', _, _, _}=Resp, [], _Budget) ->
     Resp;
 db_resp_bounded({'ok', Status, Headers, Ref}=Resp, Expect, Budget) ->

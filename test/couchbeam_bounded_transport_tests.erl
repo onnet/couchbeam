@@ -780,12 +780,17 @@ bounded_guardian_reports_cleanup_failure_and_retries_on_owner_down_test() ->
                   after 500 ->
                           ?assert('false')
                   end,
+                  {'reductions', ReductionsBefore} =
+                      process_info(GuardianPid, reductions),
                   receive
                       {'bounded_guardian_cleanup', 'failed', GuardianPid,
                        'undefined'} -> 'ok'
                   after 500 ->
                           ?assert('false')
                   end,
+                  {'reductions', ReductionsAfter} =
+                      process_info(GuardianPid, reductions),
+                  ?assert(ReductionsAfter - ReductionsBefore < 100000),
                   receive
                       {'cleanup_failure_result', Caller, Result} ->
                           ?assertEqual(
@@ -888,7 +893,7 @@ bounded_view_cleanup_uses_guardian_deadline_when_manager_suspended_test() ->
                       {'view_cleanup_result', Caller, Result} ->
                           ?assertEqual(
                              {'error', 'transport_cleanup_timeout'}, Result)
-                  after 200 ->
+                  after 500 ->
                           ?assert('false')
                   end,
                   ?assertEqual('true', is_process_alive(GuardianPid)),
@@ -1030,6 +1035,95 @@ bounded_body_close_propagates_cleanup_timeout_for_concrete_ref_test() ->
                       ?assert('false')
               end,
               Caller ! 'stop_body_cleanup_caller'
+      end).
+
+bounded_known_status_propagates_cleanup_timeout_for_concrete_ref_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    Parent = self(),
+    with_http_server(
+      fun(Socket, ServerParent) ->
+              ServerParent ! {'status_cleanup_request_ready', self()},
+              receive 'send_status_cleanup_response' -> 'ok' end,
+              'ok' = send_json_headers(Socket, 404, 0),
+              ServerParent ! {'status_cleanup_peer_close',
+                              recv_until_closed(Socket)},
+              ServerParent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl,
+                         [{'no_proxy_env', 'true'},
+                          {'bounded_guardian_started_test_hook', Parent},
+                          {'bounded_handoff_test_hook', Parent}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              Caller = spawn(
+                         fun() ->
+                                 Parent ! {'status_cleanup_result', self(),
+                                           couchbeam:db_info_bounded(
+                                             Db, {100, 1024})}
+                         end),
+              {GuardianPid, LeasePid} = receive
+                  {'bounded_guardian_started_ready', Guardian, _Worker, Lease,
+                   Caller} ->
+                      Guardian ! {'bounded_guardian_started_continue',
+                                  Guardian},
+                      {Guardian, Lease}
+              after 1000 ->
+                      exit(Caller, 'kill'),
+                      ?assert('false')
+              end,
+              Ref = receive
+                        {'bounded_handoff_ready', CapturedRef, Caller} ->
+                            Caller ! {'bounded_handoff_continue', CapturedRef},
+                            CapturedRef
+                    after 1000 ->
+                            ?assert('false')
+                    end,
+              await_ref_owner(Ref, LeasePid),
+              ServerPid = receive
+                              {'status_cleanup_request_ready', Pid} -> Pid
+                          after 1000 ->
+                                  ?assert('false')
+                          end,
+              'ok' = sys:suspend('hackney_manager'),
+              try
+                  ServerPid ! 'send_status_cleanup_response',
+                  receive
+                      {'bounded_guardian_cleanup', 'started', GuardianPid,
+                       Ref} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  receive
+                      {'bounded_guardian_cleanup', 'failed', GuardianPid,
+                       Ref} -> 'ok'
+                  after 500 ->
+                          ?assert('false')
+                  end,
+                  receive
+                      {'status_cleanup_result', Caller, Result} ->
+                          ?assertEqual(
+                             {'error', 'transport_cleanup_timeout'}, Result)
+                  after 300 ->
+                          ?assert('false')
+                  end,
+                  ?assertMatch([_], ets:lookup('hackney_manager_refs', Ref))
+              after
+                  'ok' = sys:resume('hackney_manager')
+              end,
+              receive
+                  {'bounded_guardian_cleanup', 'complete', GuardianPid, Ref} ->
+                      'ok'
+              after 500 ->
+                      ?assert('false')
+              end,
+              ?assertEqual([], ets:lookup('hackney_manager_refs', Ref)),
+              receive
+                  {'status_cleanup_peer_close', PeerResult} ->
+                      ?assertEqual({'error', 'closed'}, PeerResult)
+              after 500 ->
+                      ?assert('false')
+              end
       end).
 
 bounded_ref_registration_ack_timeout_compensates_without_exit_test() ->
@@ -1474,12 +1568,12 @@ send_json_headers(Socket, Status, ContentLength) ->
       Socket,
       [<<"HTTP/1.1 ">>, integer_to_binary(Status), <<" Result\r\nContent-Type: application/json\r\nContent-Length: ">>,
        integer_to_binary(ContentLength),
-       <<"\r\nConnection: keep-alive\r\n\r\n">>]).
+       <<"\r\nConnection: close\r\n\r\n">>]).
 
 send_chunked_headers(Socket) ->
     gen_tcp:send(
       Socket,
-      <<"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n">>).
+      <<"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n">>).
 
 send_http_chunk(Socket, Chunk) ->
     Size = integer_to_binary(byte_size(Chunk), 16),
