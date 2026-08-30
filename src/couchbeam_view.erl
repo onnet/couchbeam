@@ -86,7 +86,7 @@ fetch_bounded(Db, ViewName, Options, BudgetSpec) ->
                     MonitorRef = erlang:monitor('process', StreamPid),
                     bounded_view_result(
                       collect_bounded_view_results(
-                        Ref, StreamPid, MonitorRef, Budget, []));
+                        Ref, StreamPid, MonitorRef, Budget, [], 'undefined'));
                 {'error', _}=Error ->
                     Error
             end;
@@ -109,11 +109,12 @@ bounded_view_result(Result) ->
 
 -spec collect_bounded_view_results(reference(), pid(), reference(),
                                    couchbeam_httpc:request_budget(),
-                                   [ejson_object()]) ->
+                                   [ejson_object()], 'undefined' | pid()) ->
           {'ok', [ejson_object()], non_neg_integer()} |
           {'error', term()} | {'error', term(), [ejson_object()]}.
 collect_bounded_view_results(Ref, StreamPid, MonitorRef,
-                             #{'deadline_ms' := DeadlineMs}=Budget, Acc) ->
+                             #{'deadline_ms' := DeadlineMs}=Budget, Acc,
+                             GuardianPid) ->
     case DeadlineMs - erlang:monotonic_time('millisecond') of
         TimeoutMs when TimeoutMs > 0 ->
             receive
@@ -123,7 +124,12 @@ collect_bounded_view_results(Ref, StreamPid, MonitorRef,
                       {'ok', lists:reverse(Acc), Bytes});
                 {Ref, {'row', Row}} ->
                     collect_bounded_view_results(
-                      Ref, StreamPid, MonitorRef, Budget, [Row | Acc]);
+                      Ref, StreamPid, MonitorRef, Budget, [Row | Acc],
+                      GuardianPid);
+                {'bounded_transport_guardian', StreamPid, NewGuardianPid} ->
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, Acc,
+                      NewGuardianPid);
                 {Ref, {'error', Error}} when Acc =:= [] ->
                     bounded_view_terminal(
                       Ref, MonitorRef, {'error', Error});
@@ -132,6 +138,8 @@ collect_bounded_view_results(Ref, StreamPid, MonitorRef,
                       Ref, MonitorRef,
                       {'error', Error, lists:reverse(Acc)});
                 {'DOWN', MonitorRef, 'process', StreamPid, Reason} ->
+                    await_stream_transport_cleanup(
+                      StreamPid, GuardianPid, Budget),
                     flush_view_messages(Ref),
                     {'error', {'stream_down', Reason}}
             after TimeoutMs ->
@@ -140,6 +148,37 @@ collect_bounded_view_results(Ref, StreamPid, MonitorRef,
         _ ->
             bounded_view_timeout(Ref, StreamPid, MonitorRef)
     end.
+
+-spec await_stream_transport_cleanup(
+        pid(), 'undefined' | pid(), couchbeam_httpc:request_budget()) -> 'ok'.
+await_stream_transport_cleanup(StreamPid, 'undefined', Budget) ->
+    case bounded_remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'bounded_transport_guardian', StreamPid, GuardianPid} ->
+                    await_stream_transport_cleanup(
+                      StreamPid, GuardianPid, Budget)
+            after TimeoutMs ->
+                    'ok'
+            end;
+        _ ->
+            'ok'
+    end;
+await_stream_transport_cleanup(StreamPid, _GuardianPid, Budget) ->
+    case bounded_remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'bounded_transport_cleanup', StreamPid, _Ref} -> 'ok'
+            after TimeoutMs ->
+                    exit({'transport_cleanup_timeout', StreamPid})
+            end;
+        _ ->
+            exit({'transport_cleanup_timeout', StreamPid})
+    end.
+
+-spec bounded_remaining_timeout(couchbeam_httpc:request_budget()) -> integer().
+bounded_remaining_timeout(#{'deadline_ms' := DeadlineMs}) ->
+    DeadlineMs - erlang:monotonic_time('millisecond').
 
 -spec bounded_view_timeout(reference(), pid(), reference()) ->
           {'error', term()}.

@@ -110,7 +110,7 @@ run_bounded_worker(WorkFun, ResultFun, Budget) ->
     Token = make_ref(),
     {WorkerPid, MonitorRef} = spawn_monitor(
                                 fun() -> Parent ! {Token, WorkFun()} end),
-    guard_request_worker(Parent, WorkerPid),
+    guard_ephemeral_worker(Parent, WorkerPid),
     case remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
             receive
@@ -137,6 +137,20 @@ run_bounded_worker(WorkFun, ResultFun, Budget) ->
             flush_request_result(Token),
             {'error', 'timeout'}
     end.
+
+-spec guard_ephemeral_worker(pid(), pid()) -> 'ok'.
+guard_ephemeral_worker(Parent, WorkerPid) ->
+    _ = spawn(fun() ->
+                      ParentRef = erlang:monitor('process', Parent),
+                      WorkerRef = erlang:monitor('process', WorkerPid),
+                      receive
+                          {'DOWN', ParentRef, 'process', Parent, _Reason} ->
+                              exit(WorkerPid, 'kill');
+                          {'DOWN', WorkerRef, 'process', WorkerPid, _Reason} ->
+                              'ok'
+                      end
+              end),
+    'ok'.
 
 -spec cancel_request(reference()) -> 'ok'.
 cancel_request(Ref) ->
@@ -306,27 +320,222 @@ request_bounded(Method, Url, Headers, Body, Options, Budget,
                 LifecycleOwner) ->
     Parent = self(),
     Token = make_ref(),
-    LeasePid = spawn(fun transport_lease/0),
     HandoffHook = handoff_test_hook(Options),
     UploadHook = upload_test_hook(Options),
+    UploadContextHook = upload_context_test_hook(Options),
+    GuardianHook = guardian_ready_test_hook(Options),
     RequestOptions = [{'async', 'once'}, {'stream_to', Parent}
                       | proplists:delete(
                           'async', proplists:delete(
                                      'stream_to', strip_test_options(Options)))],
-    {WorkerPid, MonitorRef} = spawn_monitor(
-                                fun() ->
-                                        Result = request(Method, Url, Headers,
-                                                         Body, RequestOptions),
-                                        Parent ! {Token, Result},
-                                        receive
-                                            {Token, 'release'} -> 'ok'
-                                        end
-                                end),
-    notify_upload_worker(UploadHook, WorkerPid),
-    guard_request_worker(LifecycleOwner, WorkerPid),
-    guard_transport_lease(LifecycleOwner, LeasePid),
-    await_bounded_request(Token, WorkerPid, MonitorRef, LeasePid,
-                          HandoffHook, Budget).
+    RequestFun = fun() ->
+                         request(Method, Url, Headers, Body, RequestOptions)
+                 end,
+    case start_request_guardian(Parent, LifecycleOwner, Token, Budget) of
+        {'ok', GuardianPid} ->
+            case before_guardian_resources(
+                   GuardianHook, GuardianPid, Budget) of
+                'ok' ->
+                    GuardianPid ! {Token, 'start', RequestFun, UploadHook,
+                                   UploadContextHook},
+                    await_guardian_resources(
+                      Token, GuardianPid, HandoffHook, Budget);
+                {'error', _}=Error ->
+                    exit(GuardianPid, 'kill'),
+                    Error
+            end;
+        {'error', _}=Error ->
+            Error
+    end.
+
+-spec start_request_guardian(pid(), pid(), reference(), request_budget()) ->
+          {'ok', pid()} | {'error', 'timeout'}.
+start_request_guardian(Parent, LifecycleOwner, Token, Budget) ->
+    GuardianPid = spawn(
+                    fun() ->
+                            request_guardian_init(
+                              Parent, LifecycleOwner, Token, Budget)
+                    end),
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Token, 'guardian_ready', GuardianPid} ->
+                    {'ok', GuardianPid}
+            after TimeoutMs ->
+                    exit(GuardianPid, 'kill'),
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            exit(GuardianPid, 'kill'),
+            {'error', 'timeout'}
+    end.
+
+-spec request_guardian_init(pid(), pid(), reference(), request_budget()) ->
+          no_return().
+request_guardian_init(Parent, LifecycleOwner, Token, Budget) ->
+    OwnerMonitors = monitor_request_owners(Parent, LifecycleOwner),
+    Parent ! {Token, 'guardian_ready', self()},
+    notify_lifecycle_guardian(LifecycleOwner, Parent, self()),
+    request_guardian_await_start(
+      Parent, LifecycleOwner, Token, Budget, OwnerMonitors).
+
+-spec monitor_request_owners(pid(), pid()) -> [reference()].
+monitor_request_owners(Parent, Parent) ->
+    [erlang:monitor('process', Parent)];
+monitor_request_owners(Parent, LifecycleOwner) ->
+    [erlang:monitor('process', Parent),
+     erlang:monitor('process', LifecycleOwner)].
+
+-spec request_guardian_await_start(pid(), pid(), reference(), request_budget(),
+                                   [reference()]) -> no_return().
+request_guardian_await_start(Parent, LifecycleOwner, Token, Budget,
+                             OwnerMonitors) ->
+    receive
+        {Token, 'start', RequestFun, UploadHook, UploadContextHook} ->
+            LeasePid = spawn(fun transport_lease/0),
+            WorkerPid = spawn(
+                          fun() ->
+                                  Result = RequestFun(),
+                                  Parent ! {Token, Result},
+                                  receive
+                                      {Token, 'release'} -> 'ok'
+                                  end
+                          end),
+            WorkerRef = erlang:monitor('process', WorkerPid),
+            LeaseRef = erlang:monitor('process', LeasePid),
+            notify_upload_worker(UploadHook, WorkerPid),
+            notify_upload_context(
+              UploadContextHook, WorkerPid, LeasePid, self(), Parent),
+            Parent ! {Token, 'guardian_started', self(), WorkerPid, LeasePid},
+            request_guardian_loop(
+              Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
+              WorkerPid, WorkerRef, LeasePid, LeaseRef, 'undefined');
+        {'DOWN', MonitorRef, 'process', _Pid, _Reason} ->
+            case lists:member(MonitorRef, OwnerMonitors) of
+                'true' -> exit('normal');
+                'false' ->
+                    request_guardian_await_start(
+                      Parent, LifecycleOwner, Token, Budget, OwnerMonitors)
+            end
+    end.
+
+-spec request_guardian_loop(pid(), pid(), reference(), request_budget(),
+                            [reference()], pid(), 'down' | reference(), pid(),
+                            reference(), 'undefined' | reference()) ->
+          no_return().
+request_guardian_loop(Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
+                      WorkerPid, WorkerRef, LeasePid, LeaseRef, Ref) ->
+    receive
+        {Token, 'known_ref', KnownRef, From} ->
+            From ! {Token, 'known_ref_ack', self(), KnownRef},
+            request_guardian_loop(
+              Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
+              WorkerPid, WorkerRef, LeasePid, LeaseRef, KnownRef);
+        {'DOWN', MonitorRef, 'process', _Pid, _Reason} ->
+            case lists:member(MonitorRef, OwnerMonitors) of
+                'true' ->
+                    guardian_cancel_dependents(
+                      Parent, LifecycleOwner, Budget, WorkerPid, WorkerRef,
+                      LeasePid, LeaseRef, Ref);
+                'false' when MonitorRef =:= LeaseRef ->
+                    exit('normal');
+                'false' when MonitorRef =:= WorkerRef ->
+                    request_guardian_loop(
+                      Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
+                      WorkerPid, 'down', LeasePid, LeaseRef, Ref);
+                'false' ->
+                    request_guardian_loop(
+                      Parent, LifecycleOwner, Token, Budget, OwnerMonitors,
+                      WorkerPid, WorkerRef, LeasePid, LeaseRef, Ref)
+            end
+    end.
+
+-spec guardian_cancel_dependents(pid(), pid(), request_budget(), pid(),
+                                 'down' | reference(), pid(), reference(),
+                                 'undefined' | reference()) -> no_return().
+guardian_cancel_dependents(Parent, LifecycleOwner, Budget, WorkerPid,
+                           WorkerRef, LeasePid, LeaseRef, Ref) ->
+    maybe_stop_guardian_worker(WorkerPid, WorkerRef),
+    exit(LeasePid, 'kill'),
+    CleanupBudget = cleanup_deadline(Budget),
+    maybe_await_guardian_worker(WorkerPid, WorkerRef, CleanupBudget),
+    require_guardian_dependent_down(LeasePid, LeaseRef, CleanupBudget),
+    case Ref of
+        'undefined' ->
+            case await_owned_transport_cleanup(WorkerPid, CleanupBudget) of
+                'ok' -> 'ok';
+                {'error', 'timeout'} ->
+                    exit({'transport_cleanup_timeout', WorkerPid})
+            end;
+        _ ->
+            require_ownership_barrier(Ref, LeasePid, CleanupBudget),
+            require_request_cleanup(Ref, CleanupBudget)
+    end,
+    notify_lifecycle_cleanup(LifecycleOwner, Parent, Ref),
+    exit('normal').
+
+-spec maybe_stop_guardian_worker(pid(), 'down' | reference()) -> 'ok'.
+maybe_stop_guardian_worker(_WorkerPid, 'down') ->
+    'ok';
+maybe_stop_guardian_worker(WorkerPid, _WorkerRef) ->
+    exit(WorkerPid, 'kill'),
+    'ok'.
+
+-spec maybe_await_guardian_worker(pid(), 'down' | reference(),
+                                  request_budget()) -> 'ok'.
+maybe_await_guardian_worker(_WorkerPid, 'down', _Budget) ->
+    'ok';
+maybe_await_guardian_worker(WorkerPid, WorkerRef, Budget) ->
+    require_guardian_dependent_down(WorkerPid, WorkerRef, Budget).
+
+-spec await_guardian_dependent_down(pid(), reference(), request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+await_guardian_dependent_down(Pid, MonitorRef, Budget) ->
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'DOWN', MonitorRef, 'process', Pid, _Reason} -> 'ok'
+            after TimeoutMs ->
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            {'error', 'timeout'}
+    end.
+
+-spec require_guardian_dependent_down(pid(), reference(), request_budget()) ->
+          'ok'.
+require_guardian_dependent_down(Pid, MonitorRef, Budget) ->
+    case await_guardian_dependent_down(Pid, MonitorRef, Budget) of
+        'ok' -> 'ok';
+        {'error', 'timeout'} -> exit({'transport_cleanup_timeout', Pid})
+    end.
+
+-spec await_guardian_resources(reference(), pid(), term(), request_budget()) ->
+          {'ok', reference()} | {'error', term()}.
+await_guardian_resources(Token, GuardianPid, HandoffHook, Budget) ->
+    GuardianRef = erlang:monitor('process', GuardianPid),
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Token, 'guardian_started', GuardianPid,
+                 WorkerPid, LeasePid} ->
+                    erlang:demonitor(GuardianRef, ['flush']),
+                    MonitorRef = erlang:monitor('process', WorkerPid),
+                    await_bounded_request(
+                      Token, WorkerPid, MonitorRef, LeasePid, GuardianPid,
+                      HandoffHook, Budget);
+                {'DOWN', GuardianRef, 'process', GuardianPid, _Reason} ->
+                    {'error', 'request_guardian_down'}
+            after TimeoutMs ->
+                    erlang:demonitor(GuardianRef, ['flush']),
+                    exit(GuardianPid, 'kill'),
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            erlang:demonitor(GuardianRef, ['flush']),
+            exit(GuardianPid, 'kill'),
+            {'error', 'timeout'}
+    end.
 
 -spec transport_lease() -> no_return().
 transport_lease() ->
@@ -334,43 +543,16 @@ transport_lease() ->
         'stop' -> exit('normal')
     end.
 
--spec guard_request_worker(pid(), pid()) -> 'ok'.
-guard_request_worker(Parent, WorkerPid) ->
-    _ = spawn(fun() ->
-                      ParentRef = erlang:monitor('process', Parent),
-                      WorkerRef = erlang:monitor('process', WorkerPid),
-                      receive
-                          {'DOWN', ParentRef, 'process', Parent, _Reason} ->
-                              exit(WorkerPid, 'kill');
-                          {'DOWN', WorkerRef, 'process', WorkerPid, _Reason} ->
-                              'ok'
-                      end
-              end),
-    'ok'.
-
--spec guard_transport_lease(pid(), pid()) -> 'ok'.
-guard_transport_lease(Parent, LeasePid) ->
-    _ = spawn(fun() ->
-                      ParentRef = erlang:monitor('process', Parent),
-                      LeaseRef = erlang:monitor('process', LeasePid),
-                      receive
-                          {'DOWN', ParentRef, 'process', Parent, _Reason} ->
-                              exit(LeasePid, 'kill');
-                          {'DOWN', LeaseRef, 'process', LeasePid, _Reason} ->
-                              'ok'
-                      end
-              end),
-    'ok'.
-
--spec await_bounded_request(reference(), pid(), reference(), pid(), term(),
+-spec await_bounded_request(reference(), pid(), reference(), pid(), pid(), term(),
                             request_budget()) ->
           {'ok', reference()} | {'error', term()}.
-await_bounded_request(Token, WorkerPid, MonitorRef, LeasePid, HandoffHook,
-                      Budget) ->
+await_bounded_request(Token, WorkerPid, MonitorRef, LeasePid, GuardianPid,
+                      HandoffHook, Budget) ->
     case remaining_timeout(Budget) of
         TimeoutMs when TimeoutMs > 0 ->
             receive
                 {Token, {'ok', Ref}} when is_reference(Ref) ->
+                    guardian_register_ref(GuardianPid, Token, Ref, Budget),
                     adopt_bounded_request(
                       Token, WorkerPid, MonitorRef, LeasePid, Ref,
                       HandoffHook, Budget);
@@ -616,6 +798,34 @@ flush_response_messages(Ref) ->
             'ok'
     end.
 
+-spec guardian_register_ref(pid(), reference(), reference(), request_budget()) ->
+          'ok'.
+guardian_register_ref(GuardianPid, Token, Ref, Budget) ->
+    GuardianPid ! {Token, 'known_ref', Ref, self()},
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Token, 'known_ref_ack', GuardianPid, Ref} -> 'ok'
+            after TimeoutMs ->
+                    exit({'transport_guardian_timeout', Ref})
+            end;
+        _ ->
+            exit({'transport_guardian_timeout', Ref})
+    end.
+
+-spec notify_lifecycle_guardian(pid(), pid(), pid()) -> 'ok'.
+notify_lifecycle_guardian(Parent, Parent, _GuardianPid) ->
+    'ok';
+notify_lifecycle_guardian(LifecycleOwner, Parent, GuardianPid) ->
+    LifecycleOwner ! {'bounded_transport_guardian', Parent, GuardianPid},
+    'ok'.
+
+-spec notify_lifecycle_cleanup(pid(), pid(), 'undefined' | reference()) ->
+          'ok'.
+notify_lifecycle_cleanup(LifecycleOwner, Parent, Ref) ->
+    LifecycleOwner ! {'bounded_transport_cleanup', Parent, Ref},
+    'ok'.
+
 -ifdef(TEST).
 -spec handoff_test_hook(list()) -> 'undefined' | pid().
 handoff_test_hook(Options) ->
@@ -624,6 +834,16 @@ handoff_test_hook(Options) ->
 -spec upload_test_hook(list()) -> 'undefined' | pid().
 upload_test_hook(Options) ->
     proplists:get_value('bounded_upload_test_hook', Options, 'undefined').
+
+-spec upload_context_test_hook(list()) -> 'undefined' | pid().
+upload_context_test_hook(Options) ->
+    proplists:get_value(
+      'bounded_upload_context_test_hook', Options, 'undefined').
+
+-spec guardian_ready_test_hook(list()) -> 'undefined' | pid().
+guardian_ready_test_hook(Options) ->
+    proplists:get_value(
+      'bounded_guardian_ready_test_hook', Options, 'undefined').
 
 -spec encode_test_delay(list()) -> non_neg_integer().
 encode_test_delay(Options) ->
@@ -638,7 +858,11 @@ strip_test_options(Options) ->
       'bounded_handoff_test_hook',
       proplists:delete(
         'bounded_upload_test_hook',
-        proplists:delete('bounded_encode_test_delay_ms', Options))).
+        proplists:delete(
+          'bounded_upload_context_test_hook',
+          proplists:delete(
+            'bounded_guardian_ready_test_hook',
+            proplists:delete('bounded_encode_test_delay_ms', Options))))).
 -else.
 -spec handoff_test_hook(list()) -> 'undefined'.
 handoff_test_hook(_Options) ->
@@ -646,6 +870,14 @@ handoff_test_hook(_Options) ->
 
 -spec upload_test_hook(list()) -> 'undefined'.
 upload_test_hook(_Options) ->
+    'undefined'.
+
+-spec upload_context_test_hook(list()) -> 'undefined'.
+upload_context_test_hook(_Options) ->
+    'undefined'.
+
+-spec guardian_ready_test_hook(list()) -> 'undefined'.
+guardian_ready_test_hook(_Options) ->
     'undefined'.
 
 -spec encode_test_delay(list()) -> 0.
@@ -663,6 +895,39 @@ notify_upload_worker('undefined', _WorkerPid) ->
 notify_upload_worker(HookPid, WorkerPid) ->
     HookPid ! {'bounded_upload_worker', WorkerPid},
     'ok'.
+
+-ifdef(TEST).
+-spec notify_upload_context('undefined' | pid(), pid(), pid(), pid(), pid()) ->
+          'ok'.
+notify_upload_context('undefined', _WorkerPid, _LeasePid, _GuardianPid,
+                      _Parent) ->
+    'ok';
+notify_upload_context(HookPid, WorkerPid, LeasePid, GuardianPid, Parent) ->
+    HookPid ! {'bounded_upload_context', WorkerPid, LeasePid,
+               GuardianPid, Parent},
+    'ok'.
+-else.
+-spec notify_upload_context(term(), pid(), pid(), pid(), pid()) -> 'ok'.
+notify_upload_context(_Hook, _WorkerPid, _LeasePid, _GuardianPid, _Parent) ->
+    'ok'.
+-endif.
+
+-spec before_guardian_resources('undefined' | pid(), pid(), request_budget()) ->
+          'ok' | {'error', 'timeout'}.
+before_guardian_resources('undefined', _GuardianPid, _Budget) ->
+    'ok';
+before_guardian_resources(HookPid, GuardianPid, Budget) ->
+    HookPid ! {'bounded_guardian_ready', GuardianPid, self()},
+    case remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'bounded_guardian_continue', GuardianPid} -> 'ok'
+            after TimeoutMs ->
+                    {'error', 'timeout'}
+            end;
+        _ ->
+            {'error', 'timeout'}
+    end.
 
 -spec maybe_delay_encode(non_neg_integer()) -> 'ok'.
 maybe_delay_encode(0) ->

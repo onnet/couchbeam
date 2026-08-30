@@ -513,15 +513,28 @@ bounded_view_owner_death_cancels_post_transport_test() ->
                          BaseUrl,
                          [{'no_proxy_env', 'true'},
                           {'socket_options', [{'sndbuf', 4096}]},
-                          {'bounded_upload_test_hook', Parent}]),
+                          {'bounded_upload_test_hook', Parent},
+                          {'bounded_upload_context_test_hook', Parent}]),
               {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
               Caller = spawn(
                          fun() ->
-                                 Parent ! {'owner_death_result', self(),
-                                           couchbeam_view:fetch_bounded(
-                                             Db, 'all_docs',
-                                             [{'keys', [Key]}],
-                                             {2000, 1024})}
+                                 Result = couchbeam_view:fetch_bounded(
+                                            Db, 'all_docs',
+                                            [{'keys', [Key]}],
+                                            {2000, 1024}),
+                                 {Ref, Worker, Lease} = receive
+                                     {'owner_death_context', Context} -> Context
+                                 end,
+                                 Parent ! {
+                                   'owner_death_api_returned', self(), Result,
+                                   ets:lookup('hackney_manager_refs', Ref) =:= [],
+                                   is_process_alive(Worker),
+                                   is_process_alive(Lease)},
+                                 receive
+                                     {'peer_observed_before_result', Ref} ->
+                                         Parent ! {'owner_death_result', self(),
+                                                   Result}
+                                 end
                          end),
               WorkerPid = receive
                               {'bounded_upload_worker', Worker} -> Worker
@@ -533,25 +546,95 @@ bounded_view_owner_death_cancels_post_transport_test() ->
                           after 1000 ->
                                   ?assert('false')
                           end,
+              {WorkerPid, LeasePid, GuardianPid, ViewPid} = receive
+                  {'bounded_upload_context', WorkerPid, Lease, Guardian,
+                   StreamPid} ->
+                      {WorkerPid, Lease, Guardian, StreamPid}
+              after 1000 ->
+                      ?assert('false')
+              end,
               Ref = owned_request_ref(WorkerPid),
+              Caller ! {'owner_death_context', {Ref, WorkerPid, LeasePid}},
               Started = erlang:monotonic_time('millisecond'),
-              exit(Caller, 'kill'),
+              exit(ViewPid, 'kill'),
               ServerPid ! 'observe_owner_close',
-              ?assertEqual('ok', await_ref_absent(Ref, 200)),
+              receive
+                  {'owner_death_api_returned', Caller, Result,
+                   RefAbsent, WorkerAlive, LeaseAlive} ->
+                      ?assertMatch({'error', {'stream_down', _}}, Result),
+                      ?assertEqual('true', RefAbsent),
+                      ?assertEqual('false', WorkerAlive),
+                      ?assertEqual('false', LeaseAlive)
+              after 200 ->
+                      ?assert('false')
+              end,
               receive
                   {'owner_death_peer_close', PeerResult} ->
                       ?assertEqual({'error', 'closed'}, PeerResult)
               after 200 ->
                       ?assert('false')
               end,
+              Caller ! {'peer_observed_before_result', Ref},
+              receive
+                  {'owner_death_result', Caller, FinalResult} ->
+                      ?assertMatch({'error', {'stream_down', _}}, FinalResult)
+              after 200 ->
+                      ?assert('false')
+              end,
               Elapsed = erlang:monotonic_time('millisecond') - Started,
               ?assert(Elapsed < 200),
-              receive
-                  {'owner_death_result', Caller, _Result} -> ?assert('false')
-              after 0 ->
-                      'ok'
-              end
+              ?assertEqual('false', is_process_alive(GuardianPid))
       end).
+
+bounded_direct_caller_death_before_guardian_resources_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    Parent = self(),
+    BeforeRefs = lists:sort(ets:tab2list('hackney_manager_refs')),
+    {'ok', ListenSocket} = gen_tcp:listen(
+                             0, ['binary', {'active', 'false'},
+                                 {'reuseaddr', 'true'}]),
+    {'ok', {_Address, Port}} = inet:sockname(ListenSocket),
+    BaseUrl = iolist_to_binary(
+                [<<"http://127.0.0.1:">>, integer_to_binary(Port)]),
+    try
+        Server = couchbeam:server_connection(
+                   BaseUrl,
+                   [{'no_proxy_env', 'true'},
+                    {'bounded_guardian_ready_test_hook', Parent}]),
+        {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+        Caller = spawn(
+                   fun() ->
+                           Parent ! {'pre_resource_result', self(),
+                                     couchbeam:db_info_bounded(
+                                       Db, {1000, 1024})}
+                   end),
+        receive
+            {'bounded_guardian_ready', GuardianPid, Caller} ->
+                GuardianRef = erlang:monitor('process', GuardianPid),
+                exit(Caller, 'kill'),
+                receive
+                    {'DOWN', GuardianRef, 'process', GuardianPid, _Reason} ->
+                        'ok'
+                after 200 ->
+                        ?assert('false')
+                end,
+                ?assertEqual(
+                   BeforeRefs,
+                   lists:sort(ets:tab2list('hackney_manager_refs'))),
+                ?assertEqual({'error', 'timeout'},
+                             gen_tcp:accept(ListenSocket, 20)),
+                receive
+                    {'pre_resource_result', Caller, _Result} -> ?assert('false')
+                after 0 ->
+                        'ok'
+                end
+        after 1000 ->
+                exit(Caller, 'kill'),
+                ?assert('false')
+        end
+    after
+        gen_tcp:close(ListenSocket)
+    end.
 
 bounded_save_doc_encode_obeys_deadline_before_transport_test() ->
     assert_encode_deadline_before_transport(
@@ -786,23 +869,6 @@ owned_request_ref(WorkerPid, DeadlineMs) ->
                     owned_request_ref(WorkerPid, DeadlineMs);
                 'false' ->
                     ?assert('false')
-            end
-    end.
-
-await_ref_absent(Ref, TimeoutMs) ->
-    await_ref_absent_until(
-      Ref, erlang:monotonic_time('millisecond') + TimeoutMs).
-
-await_ref_absent_until(Ref, DeadlineMs) ->
-    case ets:lookup('hackney_manager_refs', Ref) of
-        [] -> 'ok';
-        [_] ->
-            case erlang:monotonic_time('millisecond') < DeadlineMs of
-                'true' ->
-                    erlang:yield(),
-                    await_ref_absent_until(Ref, DeadlineMs);
-                'false' ->
-                    {'error', 'timeout'}
             end
     end.
 
