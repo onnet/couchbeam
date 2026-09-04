@@ -11,6 +11,7 @@
 -export([stream/2, stream/3,
          cancel_stream/1, stream_next/1,
          fetch/1, fetch/2, fetch/3,
+         fetch_bounded/4,
          count/1, count/2, count/3,
          first/1, first/2, first/3,
          all/1, all/2,
@@ -19,6 +20,10 @@
          parse_view_options/1,
          show/2, show/3, show/4
         ]).
+
+-ifdef(TEST).
+-export([bounded_cleanup_delivery_budget/1, bounded_cleanup_wait_budget/2]).
+-endif.
 
 -define(COLLECT_TIMEOUT, 10000).
 
@@ -91,6 +96,468 @@ fetch_async(Db, ViewName, Options) ->
             collect_view_results(Ref, [], Timeout);
         Error ->
             Error
+    end.
+
+%% @doc Fetch a view with a typed request budget `{TimeoutMs, MaxBytes}'.
+%% The whole view is collected in the calling process and returned together
+%% with the cumulative raw response bytes only after the transport cleanup has
+%% been proven; rows already received are discarded on any error. The absolute
+%% deadline covers transport, JSON decode and cleanup proof; a completed view
+%% whose cleanup proof lands past the deadline is reported as
+%% `{'error', 'timeout'}'. `async'/`stream_to' options are ignored: the caller
+%% is the only consumer. See `couchbeam_httpc:new_request_budget/1' for the
+%% worst-case latency.
+%%
+%% Unlike the three document doors, this one needs the `couchbeam' application
+%% running: the view stream is a child of `couchbeam_view_sup', and
+%% `make_view/4' reaches `supervisor:start_child/2', which exits `noproc' when
+%% the supervisor is not there. That is a precondition of the door -- the same
+%% one legacy `stream/3' has -- and not one of the typed refusals below.
+-spec fetch_bounded(db(), 'all_docs' | {binary(), binary()}, list(),
+                    couchbeam_httpc:request_budget_spec()) ->
+          {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
+fetch_bounded(Db, ViewName, Options, BudgetSpec) ->
+    case usable_view_name(ViewName) of
+        'true' -> fetch_bounded_options(Db, ViewName, Options, BudgetSpec);
+        'false' -> {'error', {'invalid_view_name', ViewName}}
+    end.
+
+%% A view name the bounded door can address before any budget: `all_docs',
+%% or `{DesignName, ViewName}' with both halves a binary or a Latin-1 string
+%% — what `hackney_url:make_url/3' renders as path segments. A float or a
+%% tuple half would crash `hackney_url' after the budget clock started; an
+%% atom other than `all_docs' is refused by `make_view/4' only after the
+%% budget was created and the stream started; a string with code points
+%% above 255 crashes `hackney_bstr:to_binary/1'.
+-spec usable_view_name(term()) -> boolean().
+usable_view_name('all_docs') ->
+    'true';
+usable_view_name({DesignName, ViewName}) ->
+    usable_view_name_part(DesignName) andalso usable_view_name_part(ViewName);
+usable_view_name(_ViewName) ->
+    'false'.
+
+-spec usable_view_name_part(term()) -> boolean().
+usable_view_name_part(Part) when is_binary(Part) -> 'true';
+usable_view_name_part(Part) when is_list(Part) -> io_lib:latin1_char_list(Part);
+usable_view_name_part(_Part) -> 'false'.
+
+%% `length/1' in the guard refuses an improper list too: the exception it
+%% raises makes the guard false, and `parse_view_options/1' has a clause
+%% neither for a non-list nor for an improper tail.
+-spec fetch_bounded_options(db(), 'all_docs' | {binary(), binary()}, term(),
+                            couchbeam_httpc:request_budget_spec()) ->
+          {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
+fetch_bounded_options(Db, ViewName, Options, BudgetSpec)
+  when is_list(Options), length(Options) >= 0 ->
+    case bounded_view_query_args(Options) of
+        {'ok', #view_query_args{}} ->
+            fetch_bounded_parsed(Db, ViewName, Options, BudgetSpec);
+        {'error', Entry} ->
+            {'error', {'invalid_param', Entry}}
+    end;
+fetch_bounded_options(_Db, _ViewName, Options, _BudgetSpec) ->
+    {'error', {'invalid_param', Options}}.
+
+%% Every refusal a bounded fetch makes before any budget or connection, in
+%% the order the failures would otherwise surface: the official parser's own
+%% refusal (`{stale, bogus}' — `make_view/4' would crash on it; named by the
+%% entry, see `unparsable_view_option/2'), a value the parser cannot encode
+%% (`{key, self()}' — `couchbeam_ejson:encode/1' raises inside the parser, in
+%% the calling process), a parsed pair `hackney_url:qs/1' cannot render
+%% (`{limit, 1.5}' — `make_view/4' would crash while building the URL, after
+%% the budget clock started), and a POST body the encoder refuses (`{keys,
+%% [self()]}' — the one piece the parser stores unencoded, which would
+%% otherwise fail only inside the encoder worker of a stream already spawned
+%% under a running budget; see `encodable_view_keys/1'). The renderability
+%% scan runs on the parsed pairs, not on the raw list: the parser turns `key'
+%% into an encoded binary and `descending' into a pair. An exception the
+%% parser raises is an input error only when one of the encoded entries is
+%% its cause (jsx raises `function_clause', not `badarg', on a pid, so the
+%% class cannot be narrowed instead); anything else is a defect of the parser
+%% or the encoder and is re-raised with its stack rather than relabelled as
+%% the caller's fault.
+%% A fifth outcome is not a refusal and is worth naming: an unrecognised
+%% atom-keyed pair is neither refused nor sent -- the official parser's
+%% catch-all drops it (parity with legacy `fetch/3'), so a typo in an option
+%% name is silently ignored. Whether the bounded door should narrow that is
+%% an owner decision recorded with the port's deferred work.
+-spec bounded_view_query_args(list()) ->
+          {'ok', view_query_args()} | {'error', term()}.
+bounded_view_query_args(Options) ->
+    try parse_view_options(Options) of
+        #view_query_args{options=Parsed}=Args ->
+            case couchbeam_httpc:invalid_query_param(Parsed) of
+                'undefined' -> encodable_view_keys(Args);
+                {'invalid_param', Entry} -> {'error', Entry}
+            end;
+        {'error', Reason} ->
+            {'error', unparsable_view_option(Options, Reason)}
+    catch
+        Class:Reason:Stacktrace ->
+            case unencodable_view_option(Options) of
+                'undefined' -> erlang:raise(Class, Reason, Stacktrace);
+                Entry -> {'error', Entry}
+            end
+    end.
+
+%% The parser raised: name the entry whose value `couchbeam_ejson:encode/1'
+%% refuses (the parser encodes `key', `startkey'/`start_key' and
+%% `endkey'/`end_key' in place), or `'undefined'' when none of them is the
+%% cause.
+%% The official parser refuses exactly one thing — `{stale, V}' outside
+%% `ok'/`update_after'/`false' — and answers with its message string. The
+%% door names the entry instead, so every refusal it makes has the one shape
+%% `{invalid_param, Entry}'. Should the parser ever refuse something this
+%% walk does not recognise, its own reason is passed on rather than guessed.
+-spec unparsable_view_option(list(), term()) -> term().
+unparsable_view_option([{'stale', Value}=Entry | _Rest], _Reason)
+  when Value =/= 'ok', Value =/= 'update_after', Value =/= 'false' ->
+    Entry;
+unparsable_view_option([_Entry | Rest], Reason) ->
+    unparsable_view_option(Rest, Reason);
+unparsable_view_option([], Reason) ->
+    Reason.
+
+%% Encoded once here for the verdict; the killable worker under the budget
+%% encodes the body again. That second pass is the price of refusing before
+%% any budget exists: carrying an encoded body to the stream would mean a
+%% new field in the official `#view_query_args{}'.
+-spec encodable_view_keys(view_query_args()) ->
+          {'ok', view_query_args()} | {'error', {'keys', term()}}.
+encodable_view_keys(#view_query_args{method='post', keys=Keys}=Args) ->
+    try couchbeam_ejson:encode({[{<<"keys">>, Keys}]}) of
+        _Encoded -> {'ok', Args}
+    catch
+        _Class:_Reason -> {'error', {'keys', Keys}}
+    end;
+encodable_view_keys(#view_query_args{}=Args) ->
+    {'ok', Args}.
+
+-spec unencodable_view_option(list()) -> 'undefined' | {atom(), term()}.
+unencodable_view_option([{Key, Value}=Entry | Rest])
+  when Key =:= 'key'; Key =:= 'startkey'; Key =:= 'start_key';
+       Key =:= 'endkey'; Key =:= 'end_key' ->
+    try couchbeam_ejson:encode(Value) of
+        _Encoded -> unencodable_view_option(Rest)
+    catch
+        _Class:_Reason -> Entry
+    end;
+unencodable_view_option([_Entry | Rest]) ->
+    unencodable_view_option(Rest);
+unencodable_view_option([]) ->
+    'undefined'.
+
+-spec fetch_bounded_parsed(db(), 'all_docs' | {binary(), binary()}, list(),
+                           couchbeam_httpc:request_budget_spec()) ->
+          {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
+fetch_bounded_parsed(Db, ViewName, Options, BudgetSpec) ->
+    case couchbeam_httpc:new_request_budget(BudgetSpec) of
+        {'ok', Budget} ->
+            FetchOptions = bounded_fetch_options(Options),
+            case stream_with_budget(Db, ViewName, FetchOptions, Budget) of
+                {'ok', Ref, StreamPid} ->
+                    MonitorRef = erlang:monitor('process', StreamPid),
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, [], 'undefined');
+                {'error', _}=Error ->
+                    Error
+            end;
+        {'error', _}=Error ->
+            Error
+    end.
+
+%% A bounded fetch is the sole consumer of its stream: `async'/`stream_to'
+%% would send rows to a third party and park the decoder waiting for
+%% `stream_next' messages the collector never sends. This is the one door a
+%% budget enters through, so this is the one place they are stripped.
+-spec bounded_fetch_options(list()) -> list().
+bounded_fetch_options(Options) ->
+    proplists:delete('async', proplists:delete('stream_to', Options)).
+
+-spec collect_bounded_view_results(reference(), pid(), reference(),
+                                   couchbeam_httpc:request_budget(),
+                                   [ejson_object()],
+                                   'undefined' | pid() | 'complete' |
+                                   {'pending', couchbeam_httpc:request_budget()}) ->
+          {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
+collect_bounded_view_results(Ref, StreamPid, MonitorRef,
+                             #{'deadline_ms' := DeadlineMs}=Budget, Acc,
+                             GuardianPid) ->
+    case DeadlineMs - erlang:monotonic_time('millisecond') of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Ref, {'done', Bytes}} ->
+                    bounded_view_terminal_after_cleanup(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
+                      {'ok', lists:reverse(Acc), Bytes});
+                {Ref, {'row', Row}} ->
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, [Row | Acc],
+                      GuardianPid);
+                {'bounded_transport_guardian', StreamPid, NewGuardianPid} ->
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, Acc,
+                      NewGuardianPid);
+                {'bounded_transport_cleanup', StreamPid, _ClientRef} ->
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, Acc, 'complete');
+                {'bounded_transport_cleanup_started', StreamPid,
+                 CleanupBudget} ->
+                    collect_bounded_view_results(
+                      Ref, StreamPid, MonitorRef, Budget, Acc,
+                      {'pending', CleanupBudget});
+                {Ref, {'error', 'transport_cleanup_timeout'}=Error} ->
+                    %% The stream's own cleanup verdict, and a final one: it
+                    %% is reported either past the guardian's acknowledgement
+                    %% deadline (the first attempt failed, retries do not
+                    %% notify) or because the guardian is already dead
+                    %% (`couchbeam_httpc:await_guardian_resources/4',
+                    %% `guardian_cancel_result/3'). No lifecycle message can
+                    %% follow either way, and the second case arrives well
+                    %% inside this deadline — waiting a cleanup budget for
+                    %% one would only delay the same verdict by `TimeoutMs'.
+                    bounded_view_terminal(Ref, StreamPid, MonitorRef, Error);
+                {Ref, {'error', Error}} ->
+                    bounded_view_terminal_after_cleanup(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
+                      {'error', Error});
+                {'DOWN', MonitorRef, 'process', StreamPid, Reason} ->
+                    bounded_view_terminal_after_cleanup(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
+                      {'error', {'stream_down', Reason}})
+            after TimeoutMs ->
+                    bounded_view_timeout(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget)
+            end;
+        _ ->
+            bounded_view_timeout(
+              Ref, StreamPid, MonitorRef, GuardianPid, Budget)
+    end.
+
+-spec await_stream_transport_cleanup(
+        pid(), 'undefined' | pid() | 'complete' |
+        {'pending', couchbeam_httpc:request_budget()},
+        couchbeam_httpc:request_budget()) ->
+          'ok' | {'error', 'transport_cleanup_timeout'}.
+await_stream_transport_cleanup(_StreamPid, 'complete', _Budget) ->
+    'ok';
+await_stream_transport_cleanup(StreamPid, {'pending', CleanupBudget},
+                               _Budget) ->
+    await_stream_transport_cleanup_pending(StreamPid, CleanupBudget);
+await_stream_transport_cleanup(_StreamPid, 'undefined', _Budget) ->
+    %% No guardian was ever announced, so there is no transport to prove
+    %% closed. The announcement is sent by the stream process itself right
+    %% after it spawns the guardian (`couchbeam_httpc:start_request_guardian/4'),
+    %% and a stream's messages are ordered before its `'DOWN'', its `done'
+    %% and its error report: whichever terminal message brought the collector
+    %% here, an announcement would already have been consumed by
+    %% `collect_bounded_view_results/6'. Waiting out the cleanup budget here
+    %% would only turn a `{'stream_down', _}' verdict into a false
+    %% `transport_cleanup_timeout'.
+    'ok';
+await_stream_transport_cleanup(StreamPid, _GuardianPid, Budget) ->
+    case bounded_remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'bounded_transport_cleanup_started', StreamPid,
+                 CleanupBudget} ->
+                    await_stream_transport_cleanup_pending(
+                      StreamPid, CleanupBudget);
+                {'bounded_transport_cleanup', StreamPid, _Ref} -> 'ok'
+            after TimeoutMs ->
+                    {'error', 'transport_cleanup_timeout'}
+            end;
+        _ ->
+            {'error', 'transport_cleanup_timeout'}
+    end.
+
+%% The guardian may legitimately finish right at its own cleanup deadline;
+%% the collector grants the same delivery allowance on every path
+%% (`bounded_cleanup_wait_budget/2' does it for the cancel path).
+-spec await_stream_transport_cleanup_pending(
+        pid(), couchbeam_httpc:request_budget()) ->
+          'ok' | {'error', 'transport_cleanup_timeout'}.
+await_stream_transport_cleanup_pending(StreamPid, CleanupBudget) ->
+    Budget = bounded_cleanup_delivery_budget(CleanupBudget),
+    case bounded_remaining_timeout(Budget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {'bounded_transport_cleanup', StreamPid, _Ref} -> 'ok'
+            after TimeoutMs ->
+                    {'error', 'transport_cleanup_timeout'}
+            end;
+        _ ->
+            {'error', 'transport_cleanup_timeout'}
+    end.
+
+-spec bounded_remaining_timeout(couchbeam_httpc:request_budget()) -> integer().
+bounded_remaining_timeout(#{'deadline_ms' := DeadlineMs}) ->
+    DeadlineMs - erlang:monotonic_time('millisecond').
+
+-spec bounded_view_timeout(reference(), pid(), reference(),
+                           'undefined' | pid() | 'complete' |
+                           {'pending', couchbeam_httpc:request_budget()},
+                           couchbeam_httpc:request_budget()) ->
+          {'error', term()}.
+bounded_view_timeout(Ref, StreamPid, MonitorRef, GuardianState, Budget) ->
+    StreamPid ! {Ref, 'budget_timeout'},
+    await_bounded_view_cancel(
+      Ref, StreamPid, MonitorRef, GuardianState,
+      bounded_cleanup_budget(Budget), 'undefined').
+
+-spec await_bounded_view_cancel(reference(), pid(), reference(),
+                                'undefined' | pid() | 'complete' |
+                                {'pending', couchbeam_httpc:request_budget()},
+                                couchbeam_httpc:request_budget(),
+                                'undefined' | {'error', term()}) ->
+          {'error', term()}.
+await_bounded_view_cancel(Ref, StreamPid, MonitorRef, 'complete', _Budget,
+                          {'error', _}=Result) ->
+    bounded_view_terminal(Ref, StreamPid, MonitorRef, Result);
+await_bounded_view_cancel(Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                          Result) ->
+    WaitBudget = bounded_cleanup_wait_budget(GuardianState, Budget),
+    case bounded_remaining_timeout(WaitBudget) of
+        TimeoutMs when TimeoutMs > 0 ->
+            receive
+                {Ref, {'row', _Row}} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                      Result);
+                {'bounded_transport_guardian', StreamPid, GuardianPid} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianPid, Budget,
+                      Result);
+                {'bounded_transport_cleanup', StreamPid, _ClientRef} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, 'complete', Budget,
+                      Result);
+                {'bounded_transport_cleanup_started', StreamPid,
+                 CleanupBudget} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef,
+                      {'pending', CleanupBudget}, Budget, Result);
+                {Ref, {'done', _Bytes}} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                      {'error', 'timeout'});
+                {Ref, {'error', 'transport_cleanup_timeout'}=Error} ->
+                    %% Final at once, for the reasons given in
+                    %% `collect_bounded_view_results/6'.
+                    bounded_view_terminal(Ref, StreamPid, MonitorRef, Error);
+                {Ref, {'error', Error}} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                      {'error', Error});
+                {'DOWN', MonitorRef, 'process', StreamPid, _Reason}
+                  when GuardianState =:= 'undefined' ->
+                    %% Same reasoning as `await_stream_transport_cleanup/3':
+                    %% the stream announced no guardian before it died, so
+                    %% nothing can ever send a cleanup verdict. The deadline
+                    %% verdict is final.
+                    bounded_view_terminal(
+                      Ref, StreamPid, MonitorRef, {'error', 'timeout'});
+                {'DOWN', MonitorRef, 'process', StreamPid, _Reason} ->
+                    await_bounded_view_cancel(
+                      Ref, StreamPid, MonitorRef, GuardianState, Budget,
+                      {'error', 'timeout'})
+            after TimeoutMs ->
+                    bounded_view_terminal(
+                      Ref, StreamPid, MonitorRef,
+                      {'error', 'transport_cleanup_timeout'})
+            end;
+        _ ->
+            bounded_view_terminal(
+              Ref, StreamPid, MonitorRef,
+              {'error', 'transport_cleanup_timeout'})
+    end.
+
+-spec bounded_view_terminal_after_cleanup(
+        reference(), pid(), reference(),
+        'undefined' | pid() | 'complete' |
+        {'pending', couchbeam_httpc:request_budget()},
+        couchbeam_httpc:request_budget(), term()) -> term().
+%% A stream's `transport_cleanup_timeout' report never reaches this function:
+%% `collect_bounded_view_results/6' and `await_bounded_view_cancel/6' both
+%% treat it as final the moment it arrives, so every result that comes here
+%% still owes the caller a cleanup proof.
+bounded_view_terminal_after_cleanup(Ref, StreamPid, MonitorRef, GuardianState,
+                                    Budget, Result) ->
+    CleanupBudget = bounded_cleanup_budget(Budget),
+    case await_stream_transport_cleanup(
+           StreamPid, GuardianState, CleanupBudget) of
+        'ok' -> bounded_view_terminal(Ref, StreamPid, MonitorRef, Result);
+        {'error', 'transport_cleanup_timeout'}=Error ->
+            bounded_view_terminal(Ref, StreamPid, MonitorRef, Error)
+    end.
+
+-spec bounded_cleanup_budget(couchbeam_httpc:request_budget()) ->
+          couchbeam_httpc:request_budget().
+bounded_cleanup_budget(#{'timeout_ms' := TimeoutMs}=Budget) ->
+    Budget#{'deadline_ms' =>
+                erlang:monotonic_time('millisecond') + TimeoutMs}.
+
+-spec bounded_cleanup_wait_budget(
+        'undefined' | pid() | 'complete' |
+        {'pending', couchbeam_httpc:request_budget()},
+        couchbeam_httpc:request_budget()) -> couchbeam_httpc:request_budget().
+bounded_cleanup_wait_budget({'pending', CleanupBudget}, _FallbackBudget) ->
+    bounded_cleanup_delivery_budget(CleanupBudget);
+bounded_cleanup_wait_budget(GuardianPid, FallbackBudget)
+  when is_pid(GuardianPid) ->
+    %% A guardian that never announced its cleanup may be dead: the stream
+    %% then proves the cleanup itself against the manager table, on a
+    %% cleanup budget that starts strictly after this one, and reports the
+    %% outcome one budget later. The same allowance as the `pending' case,
+    %% or that report would land right after the terminal flush and stay in
+    %% the caller's mailbox. What it costs: when neither the stream nor the
+    %% guardian can answer (both dead), the cancel path waits 3T, not T.
+    bounded_cleanup_delivery_budget(FallbackBudget);
+bounded_cleanup_wait_budget(_CleanupState, FallbackBudget) ->
+    FallbackBudget.
+
+%% One `TimeoutMs' above the stream's own acknowledgement deadline
+%% (`couchbeam_httpc:cleanup_ack_deadline/1' = cleanup deadline + T): the
+%% stream reports `transport_cleanup_timeout' only after that deadline, and an
+%% allowance that expired at the same instant would let the report land after
+%% the terminal flush and stay in the caller's mailbox.
+-spec bounded_cleanup_delivery_budget(couchbeam_httpc:request_budget()) ->
+          couchbeam_httpc:request_budget().
+bounded_cleanup_delivery_budget(#{'deadline_ms' := CleanupDeadline,
+                                  'timeout_ms' := TimeoutMs}=Budget) ->
+    Budget#{'deadline_ms' => CleanupDeadline + 2 * TimeoutMs}.
+
+%% Nothing tagged with this view may outlive the API call in the caller's
+%% mailbox: neither stream messages `{Ref, _}' nor guardian lifecycle
+%% messages `{'bounded_transport_*', StreamPid, _}' that arrive after a
+%% cleanup timeout was already reported.
+-spec bounded_view_terminal(reference(), pid(), reference(), term()) -> term().
+bounded_view_terminal(Ref, StreamPid, MonitorRef, Result) ->
+    erlang:demonitor(MonitorRef, ['flush']),
+    flush_view_messages(Ref),
+    flush_lifecycle_messages(StreamPid),
+    Result.
+
+-spec flush_view_messages(reference()) -> 'ok'.
+flush_view_messages(Ref) ->
+    receive
+        {Ref, _Message} -> flush_view_messages(Ref)
+    after 0 ->
+            'ok'
+    end.
+
+-spec flush_lifecycle_messages(pid()) -> 'ok'.
+flush_lifecycle_messages(StreamPid) ->
+    receive
+        {'bounded_transport_guardian', StreamPid, _} ->
+            flush_lifecycle_messages(StreamPid);
+        {'bounded_transport_cleanup_started', StreamPid, _} ->
+            flush_lifecycle_messages(StreamPid);
+        {'bounded_transport_cleanup', StreamPid, _} ->
+            flush_lifecycle_messages(StreamPid)
+    after 0 ->
+            'ok'
     end.
 
 fetch_sync(Db, ViewName, Options) ->
@@ -228,29 +695,54 @@ stream(Db, ViewName) ->
 %% used to disctint all changes from this pid. ViewPid is the pid of
 %% the view loop process. Can be used to monitor it or kill it
 %% when needed.</p>
-stream(Db, ViewName, Options0) ->
+stream(Db, ViewName, Options) ->
+    stream_with_budget(Db, ViewName, Options, 'undefined').
+
+-spec stream_with_budget(db(), 'all_docs' | {binary(), binary()}, list(),
+                         'undefined' | couchbeam_httpc:request_budget()) ->
+          {'ok', reference()} | {'ok', reference(), pid()} | {'error', term()}.
+stream_with_budget(Db, ViewName, Options0, Budget) ->
     {To, Options1} = case proplists:get_value(stream_to, Options0) of
                          undefined ->
                              {self(), Options0};
-                         Pid ->
-                             {Pid, proplists:delete(stream_to, Options0)}
+                         StreamOwner ->
+                             {StreamOwner,
+                              proplists:delete(stream_to, Options0)}
                      end,
-
     Options = view_options(Options0),
-
+    StreamOptions = stream_options(Options, Budget),
     make_view(Db, ViewName, Options1, fun(Args, Url) ->
                                               Ref = make_ref(),
                                               Req = {Db, Url, Args},
                                               case supervisor:start_child(couchbeam_view_sup, [To,
                                                                                                Ref,
                                                                                                Req,
-                                                                                               Options]) of
-                                                  {ok, _Pid} ->
-                                                      {ok, Ref};
+                                                                                               StreamOptions]) of
+                                                  {'ok', ViewPid} ->
+                                                      stream_result(
+                                                        Ref, ViewPid, Budget);
                                                   Error ->
                                                       Error
                                               end
                                       end).
+
+-spec stream_result(reference(), pid(),
+                    'undefined' | couchbeam_httpc:request_budget()) ->
+          {'ok', reference()} | {'ok', reference(), pid()}.
+stream_result(Ref, _Pid, 'undefined') ->
+    {'ok', Ref};
+stream_result(Ref, Pid, _Budget) ->
+    {'ok', Ref, Pid}.
+
+%% The legacy stream is the official lifecycle: a stray `request_budget'
+%% option must not turn it into a bounded stream (its `{Ref, {'done', Bytes}}'
+%% and lifecycle messages would never be consumed by legacy collectors).
+-spec stream_options(list(),
+                     'undefined' | couchbeam_httpc:request_budget()) -> list().
+stream_options(Options, 'undefined') ->
+    proplists:delete('request_budget', Options);
+stream_options(Options, Budget) ->
+    [{'request_budget', Budget} | proplists:delete('request_budget', Options)].
 
 view_options(Options) ->
     Funs = [fun kz_log_id/0

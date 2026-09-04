@@ -25,10 +25,13 @@
          open_or_create_db/2, open_or_create_db/3, open_or_create_db/4,
          delete_db/1, delete_db/2,
          db_info/1,
+         db_info_bounded/2,
          design_info/2, view_cleanup/1,
          save_doc/2, save_doc/3, save_doc/4,
+         save_doc_bounded/4,
          doc_exists/2,
          open_doc/2, open_doc/3,
+         open_doc_bounded/4,
          stream_doc/1, end_doc_stream/1,
          delete_doc/2, delete_doc/3,
          save_docs/2, save_docs/3,
@@ -404,6 +407,34 @@ db_info(#db{server=Server, name=DbName, options=Opts}) ->
             Error
     end.
 
+%% @doc `db_info/1' with a typed request budget `{TimeoutMs, MaxBytes}'.
+%% Returns the database info together with the cumulative raw response bytes,
+%% only after the transport cleanup has been proven. Error atoms follow
+%% `db_info/1' (`db_not_found'); `{'error', 'timeout'}' means the absolute
+%% deadline passed before the result was delivered. See
+%% `couchbeam_httpc:new_request_budget/1' for the deadline semantics.
+-spec db_info_bounded(db(), couchbeam_httpc:request_budget_spec()) ->
+          {'ok', ejson_object(), non_neg_integer()} | {'error', term()}.
+db_info_bounded(#db{server=Server, name=DbName, options=Opts}, BudgetSpec) ->
+    case couchbeam_httpc:new_request_budget(BudgetSpec) of
+        {'ok', Budget} ->
+            Url = hackney_url:make_url(
+                    couchbeam_httpc:server_url(Server),
+                    couchbeam_util:dbname(DbName), []),
+            case couchbeam_httpc:db_request_bounded(
+                   'get', Url, [], <<>>, Opts, [200], Budget) of
+                {'ok', _Status, _Headers, Ref} ->
+                    bounded_json_object(
+                      couchbeam_httpc:bounded_json_body(Ref, Budget));
+                {'error', 'not_found'} ->
+                    {'error', 'db_not_found'};
+                Error ->
+                    Error
+            end;
+        {'error', _}=Error ->
+            Error
+    end.
+
 %% @doc test if doc with uuid exists in the given db
 %% @spec doc_exists(db(), string()) -> boolean()
 doc_exists(#db{server=Server, options=Opts}=Db, DocId) ->
@@ -462,6 +493,131 @@ open_doc(#db{server=Server, options=Opts}=Db, DocId, Params) ->
             Error
     end.
 
+%% @doc `open_doc/3' with a typed request budget `{TimeoutMs, MaxBytes}'.
+%% `Params' are CouchDB query parameters (`rev', `revs', `attachments', ...)
+%% and go to the query string verbatim. Unlike `open_doc/3' the response is
+%% always one JSON object: the `accept' pseudo-parameter is refused with
+%% `{'error', {'unsupported_param', 'accept'}}', `open_revs' (CouchDB answers
+%% it with an array of revisions) with `{'error', {'unsupported_param',
+%% 'open_revs'}}', and `attachments=true' yields inline base64 attachments,
+%% never a multipart stream. `DocId' must be a non-empty binary or Latin-1
+%% string: an empty one would address the database itself, anything else
+%% would crash inside `encode_docid/1', so both are refused with
+%% `{'error', 'missing_doc_id'}'. `Params' must be a list of `{Key, Value}'
+%% pairs — the only shape `hackney_url:make_url/3' accepts — or the offending
+%% entry is refused with `{'error', {'invalid_param', Entry}}'. Every refusal
+%% happens before any connection. Returns the document with the cumulative
+%% raw response bytes after the transport cleanup proof.
+-spec open_doc_bounded(db(), docid(), list(),
+                       couchbeam_httpc:request_budget_spec()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+open_doc_bounded(#db{server=Server, options=Opts}=Db,
+                 DocId, Params, BudgetSpec) ->
+    case usable_doc_id(DocId) of
+        'false' ->
+            {'error', 'missing_doc_id'};
+        'true' ->
+            open_doc_bounded_params(Server, Opts, Db, DocId, Params, BudgetSpec)
+    end.
+
+-spec open_doc_bounded_params(term(), list(), db(), docid(), term(),
+                              couchbeam_httpc:request_budget_spec()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+open_doc_bounded_params(Server, Opts, Db, DocId, Params, BudgetSpec) ->
+    case invalid_query_param(Params) of
+        'undefined' ->
+            case unsupported_param(Params) of
+                'undefined' ->
+                    open_doc_bounded_checked(
+                      Server, Opts, Db, DocId, Params,
+                      couchbeam_httpc:new_request_budget(BudgetSpec));
+                Param ->
+                    {'error', {'unsupported_param', Param}}
+            end;
+        {'invalid_param', _Entry}=Invalid ->
+            {'error', Invalid}
+    end.
+
+%% A document id the bounded APIs can address: `encode_docid/1' accepts a
+%% binary or a Latin-1 string, and an empty one collapses the URL to `/db/' —
+%% the database itself, whose info object would then be handed back as if it
+%% were the document. `null' (a JSON null `_id'), a string with code points
+%% above 255 and other terms would crash inside `encode_docid/1' after the
+%% caller already committed to the call.
+-spec usable_doc_id(term()) -> boolean().
+usable_doc_id(DocId) when is_binary(DocId) -> DocId =/= <<>>;
+usable_doc_id(DocId) when is_list(DocId) ->
+    DocId =/= [] andalso io_lib:latin1_char_list(DocId);
+usable_doc_id(_DocId) -> 'false'.
+
+%% Query parameters and write options are refused by the shape and
+%% renderability scan `couchbeam_httpc:invalid_query_param/1' shares with the
+%% view door: both halves of every `{Key, Value}' pair must be something
+%% `hackney_url:qs/1' can render, or URL building would crash after the budget
+%% clock started, and a malformed entry (`{accept, _, _}') would also slip
+%% past the refusal scans below.
+-spec invalid_query_param(term()) -> 'undefined' | {'invalid_param', term()}.
+invalid_query_param(Params) ->
+    couchbeam_httpc:invalid_query_param(Params).
+
+%% Unsupported parameters are refused whatever key form the caller used: the
+%% legacy `open_doc/3' reads the atom key, callers copying option lists around
+%% often carry the binary or string form, and either one would otherwise land
+%% in the query string as a literal CouchDB parameter. Runs after
+%% `invalid_query_param/1', so every entry is a pair.
+-spec unsupported_param([{term(), term()}]) -> 'undefined' | 'accept' | 'open_revs'.
+unsupported_param([]) ->
+    'undefined';
+unsupported_param([{Key, _Value} | Rest]) ->
+    case unsupported_param_name(Key) of
+        'undefined' -> unsupported_param(Rest);
+        Name -> Name
+    end.
+
+-spec unsupported_param_name(term()) -> 'undefined' | 'accept' | 'open_revs'.
+unsupported_param_name('accept') -> 'accept';
+unsupported_param_name(<<"accept">>) -> 'accept';
+unsupported_param_name("accept") -> 'accept';
+unsupported_param_name('open_revs') -> 'open_revs';
+unsupported_param_name(<<"open_revs">>) -> 'open_revs';
+unsupported_param_name("open_revs") -> 'open_revs';
+unsupported_param_name(_Key) -> 'undefined'.
+
+-spec open_doc_bounded_checked(
+        term(), list(), db(), docid(), list(),
+        {'ok', couchbeam_httpc:request_budget()} |
+        {'error', 'invalid_request_budget'}) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+open_doc_bounded_checked(Server, Opts, Db, DocId, Params, {'ok', Budget}) ->
+    DocId1 = couchbeam_util:encode_docid(DocId),
+    Url = hackney_url:make_url(
+            couchbeam_httpc:server_url(Server),
+            couchbeam_httpc:doc_url(Db, DocId1),
+            Params),
+    case couchbeam_httpc:db_request_bounded(
+           'get', Url, [], <<>>, Opts, [200, 201], Budget) of
+        {'ok', _, _, Ref} ->
+            bounded_json_object(
+              couchbeam_httpc:bounded_json_body(Ref, Budget));
+        Error ->
+            Error
+    end;
+open_doc_bounded_checked(_Server, _Opts, _Db, _DocId, _Params,
+                         {'error', _}=Error) ->
+    Error.
+
+%% The bounded read APIs promise an object; a 2xx whose body decodes to an
+%% array, number, string or null is a protocol violation, not a document.
+-spec bounded_json_object({'ok', term(), non_neg_integer()} |
+                          {'error', term()}) ->
+          {'ok', term(), non_neg_integer()} | {'error', term()}.
+bounded_json_object({'ok', {Props}=Object, Bytes}) when is_list(Props) ->
+    {'ok', Object, Bytes};
+bounded_json_object({'ok', Other, _Bytes}) ->
+    {'error', {'invalid_response', Other}};
+bounded_json_object({'error', _}=Error) ->
+    Error.
+
 %% @doc stream the multipart response of the doc API. Use this function
 %% when you get `{ok, {multipart, State}}' from the function
 %% `couchbeam:open_doc/3'.
@@ -502,6 +658,181 @@ save_doc(Db, Doc) ->
 %% @spec save_doc(Db::db(), Doc, Options::list()) -> {ok, Doc1}|{error, Error}
 save_doc(Db, Doc, Options) ->
     save_doc(Db, Doc, [], Options).
+
+%% @doc `save_doc/3' with a typed request budget `{TimeoutMs, MaxBytes}'.
+%% Unlike `save_doc/3' the document must already carry a usable `_id' — a
+%% non-empty binary: minting a UUID would be a second, unbudgeted round trip,
+%% and the id goes both into the URL and into the JSON body, where an Erlang
+%% string would encode as an array of integers — so an absent, `null', empty
+%% or non-binary `_id' is refused with `{'error', 'missing_doc_id'}' before
+%% any connection is made. `Options' must be a list of `{Key, Value}' pairs,
+%% or the offending entry is refused with `{'error', {'invalid_param', Entry}}'.
+%% The document body travels exactly as `save_doc/3' sends it — one JSON
+%% encoding, `_attachments' included, whether they are stubs or inline base64
+%% `data' (legacy picks multipart only for the explicit `Atts' argument of
+%% `save_doc/4', which has no bounded counterpart).
+%% `Options' go to the query string verbatim (`new_edits', ...) except
+%% `batch', which is refused before the connection with
+%% `{'error', {'unsupported_param', 'batch'}}': its 202 carries no revision,
+%% so the caller could not tell an applied write from a rejected one. Returns
+%% the document with the server `_id' and `_rev' plus the cumulative raw
+%% response bytes after the transport cleanup proof.
+%% Every error reported after the PUT was sent is a verdict on the reply, not
+%% a proof that the write was not applied: the PUT may have reached CouchDB
+%% and been committed. The full set is `{'error', 'timeout'}',
+%% `{'error', 'transport_cleanup_timeout'}', `{'error', 'response_too_large'}',
+%% `{'error', {'invalid_response', _}}', `{'error', {'bad_response', _}}',
+%% `{'error', {'json_decoding_failed', _}}',
+%% `{'error', {'unexpected_response_message', _}}' and the raw transport
+%% reasons `{'error', 'closed'}' / `{'error', {'closed', _}}'.
+%% The encoding step ahead of the PUT has two verdicts of its own, and they
+%% are different classes: `{'error', {'invalid_json_encoding', {Class,
+%% Reason}}}' is the document itself (a pid, a fun, a term jsx refuses),
+%% caught inside the encoder worker, while `{'error', {'json_encoding_failed',
+%% Reason}}' is that worker dying from the outside. Both are reported before
+%% anything reaches the wire.
+-spec save_doc_bounded(db(), doc(), list(),
+                       couchbeam_httpc:request_budget_spec()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+save_doc_bounded(#db{server=Server, options=Opts}=Db,
+                 {Props}=Doc, Options, BudgetSpec)
+  when is_list(Props), length(Props) >= 0 ->
+    case couchbeam_util:get_value(<<"_id">>, Props) of
+        DocId when is_binary(DocId), DocId =/= <<>> ->
+            save_doc_bounded_guarded(
+              Server, Opts, Db, Doc, DocId, Options, BudgetSpec);
+        _NoUsableId ->
+            {'error', 'missing_doc_id'}
+    end;
+save_doc_bounded(_Db, _Doc, _Options, _BudgetSpec) ->
+    %% A document is `{Proplist}' with a proper list inside; a map, a bare
+    %% list (what a bulk save takes), an improper property list (on which
+    %% `couchbeam_util:get_value/2' would crash in `lists:keyfind/3') or
+    %% anything else is refused before the budget clock starts. `length/1'
+    %% in the guard above is what refuses the improper list: the exception
+    %% it raises makes the guard false.
+    {'error', 'invalid_document'}.
+
+-spec save_doc_bounded_guarded(term(), list(), db(), doc(), docid(), term(),
+                               couchbeam_httpc:request_budget_spec()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+save_doc_bounded_guarded(Server, Opts, Db, Doc, DocId, Options, BudgetSpec) ->
+    %% Sequenced, not paired in a tuple: a tuple would evaluate
+    %% `has_batch_option/1' on a list the shape scan is about to refuse, and
+    %% `lists:any/2' has no clause for an improper tail.
+    case invalid_query_param(Options) of
+        {'invalid_param', _Entry}=Invalid ->
+            {'error', Invalid};
+        'undefined' ->
+            save_doc_bounded_batchless(
+              Server, Opts, Db, Doc, DocId, Options, BudgetSpec)
+    end.
+
+-spec save_doc_bounded_batchless(term(), list(), db(), doc(), docid(), list(),
+                                 couchbeam_httpc:request_budget_spec()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+save_doc_bounded_batchless(Server, Opts, Db, Doc, DocId, Options,
+                           BudgetSpec) ->
+    case has_batch_option(Options) of
+        'true' ->
+            %% Refused before the connection, like every other unsupported
+            %% input: a `batch' write that is executed and then rejected on
+            %% its reply leaves the caller unable to tell whether it was
+            %% applied.
+            {'error', {'unsupported_param', 'batch'}};
+        'false' ->
+            save_doc_bounded_checked(
+              Server, Opts, Db, Doc, DocId, Options,
+              couchbeam_httpc:new_request_budget(BudgetSpec))
+    end.
+
+%% Runs only on a list `invalid_query_param/1' accepted — a proper list of
+%% pairs — so the walk cannot meet an improper tail.
+-spec has_batch_option(list()) -> boolean().
+has_batch_option(Options) when is_list(Options) ->
+    lists:any(fun({Key, _Value}) -> is_batch_key(Key);
+                 (_Entry) -> 'false'
+              end, Options);
+has_batch_option(_Options) ->
+    'false'.
+
+-spec is_batch_key(term()) -> boolean().
+is_batch_key('batch') -> 'true';
+is_batch_key(<<"batch">>) -> 'true';
+is_batch_key("batch") -> 'true';
+is_batch_key(_Key) -> 'false'.
+
+-spec save_doc_bounded_checked(
+        term(), list(), db(), doc(), docid(), list(),
+        {'ok', couchbeam_httpc:request_budget()} |
+        {'error', 'invalid_request_budget'}) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+save_doc_bounded_checked(_Server, _Opts, _Db, _Doc, _DocId, _Options,
+                         {'error', _}=Error) ->
+    Error;
+save_doc_bounded_checked(Server, Opts, Db, Doc, DocId, Options,
+                         {'ok', Budget}) ->
+    EncodedDocId = couchbeam_util:encode_docid(DocId),
+    Url = hackney_url:make_url(
+            couchbeam_httpc:server_url(Server),
+            couchbeam_httpc:doc_url(Db, EncodedDocId), Options),
+    Headers = [{<<"Content-Type">>, <<"application/json">>}],
+    case couchbeam_httpc:bounded_encode_json(Doc, Budget, Opts) of
+        {'ok', EncodedDoc} ->
+            case couchbeam_httpc:db_request_bounded(
+                   'put', Url, Headers, EncodedDoc, Opts,
+                   [200, 201, 202], Budget) of
+                {'ok', _, _, Ref} ->
+                    bounded_saved_doc(Ref, Budget, DocId, Doc);
+                Error ->
+                    Error
+            end;
+        {'error', _}=Error ->
+            Error
+    end.
+
+-spec bounded_saved_doc(reference(), couchbeam_httpc:request_budget(),
+                        binary(), doc()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+bounded_saved_doc(Ref, Budget, DocId, Doc) ->
+    bounded_saved_doc_result(
+      couchbeam_httpc:bounded_json_body(Ref, Budget), DocId, Doc).
+
+-spec bounded_saved_doc_result({'ok', term(), non_neg_integer()} |
+                               {'error', term()}, binary(), doc()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+bounded_saved_doc_result({'ok', {JsonProp}, Bytes}, DocId, Doc)
+  when is_list(JsonProp) ->
+    %% The clauses below are the precedence of the verdicts: a reply that
+    %% lacks both `rev' and `id' reports `missing_rev', because the second
+    %% clause matches first.
+    case {couchbeam_util:get_value(<<"id">>, JsonProp),
+          couchbeam_util:get_value(<<"rev">>, JsonProp)} of
+        {DocId, NewRev} when is_binary(NewRev), NewRev =/= <<>> ->
+            Doc1 = couchbeam_doc:set_value(
+                     <<"_rev">>, NewRev,
+                     couchbeam_doc:set_value(<<"_id">>, DocId, Doc)),
+            {'ok', Doc1, Bytes};
+        {_NewDocId, NewRev} when not is_binary(NewRev); NewRev =:= <<>> ->
+            %% A 2xx without a string `rev' — absent (CouchDB answers
+            %% `batch=ok' that way), JSON `null' or any other shape — would
+            %% put an atom into `_rev', and the next save would send it back
+            %% as a revision. Legacy `save_doc/4' does exactly that; the
+            %% bounded write refuses instead.
+            {'error', {'invalid_response', 'missing_rev'}};
+        {NewDocId, _NewRev} when not is_binary(NewDocId); NewDocId =:= <<>> ->
+            {'error', {'invalid_response', 'missing_id'}};
+        {NewDocId, _NewRev} ->
+            %% CouchDB answers with the id it stored, which is the id in the
+            %% URL. Any other id is a misrouted or broken reply; rebinding
+            %% the caller's document to it would change its identity.
+            {'error', {'invalid_response', {'id_mismatch', DocId, NewDocId}}}
+    end;
+bounded_saved_doc_result({'ok', Other, _Bytes}, _DocId, _Doc) ->
+    %% A 2xx whose body is not a JSON object cannot carry `rev'/`id'.
+    {'error', {'invalid_response', Other}};
+bounded_saved_doc_result({'error', _}=Error, _DocId, _Doc) ->
+    Error.
 
 
 %% @doc save a *document with all its attacjments
