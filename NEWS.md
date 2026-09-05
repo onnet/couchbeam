@@ -1,6 +1,38 @@
 couchbeam NEWS
 --------------
 
+unreleased (bounded-otp27 line)
+-------------------------------
+
+- bounded doors refuse a database, design, view or `list' function name
+  that is not one request-path segment (CR/LF, `?', `#', `/', a space, a
+  tab, empty, `.' or `..'): `{error, {unsafe_db_name, Name}}',
+  `{error, {invalid_view_name, ViewName}}', `{error, {invalid_param, Entry}}'
+- the transport door behind every bounded request (`request_bounded/6,7',
+  `db_request_bounded/7') refuses a method that is not letters
+  (`{error, {unsafe_method, Method}}'), a URL whose request line would
+  split, truncate or malform (`{error, {unsafe_url, Path}}') and a header —
+  the `cookie' option included — carrying a line terminator or a shape
+  hackney cannot write (`{error, {unsafe_header, Name}}')
+- `request_line_safe/1' checks only shape and CR/LF; `addressable/1'
+  additionally checks path segments, including percent-encoded dot segments.
+  Both are exported for direct transport callers.
+- document ids with CR/LF, dot segments (also percent-encoded), or an empty
+  `_design/' suffix return `{error, missing_doc_id}'; query halves with
+  CR/LF return `{error, {invalid_param, Entry}}'
+- header names must be nonempty and contain no colon, space or tab;
+  parameterised values allow only scalar values and parameter halves.
+  Cookie options require `secure'/`http_only' = true, nonnegative integer
+  `max_age', and binary/iodata `domain'/`path' without CR/LF.
+- C0/DEL in the raw URL path is refused. SP/HT in the path is refused by
+  policy even though legacy pathencode writes `+' / `%09'. Explicit proxy
+  options return `{error, {unsupported_option, proxy}}'; callers must disable
+  environment proxies (`no_proxy_env') when their environment configures one.
+- all bounded doors require a `#db{}' first argument (function_clause on
+  another term); save_doc_bounded no longer returns invalid_document for a
+  non-db argument. Fetch input refusals precede budget creation; transport
+  refusals can occur later inside its budgeted stream.
+
 version 1.7.1 / 2025-07-24
 ---------------------------
 
@@ -311,3 +343,10 @@ moved in couchbeam_oldview module.
 - couchbeam:wait_changes, couchbeam:wait_changes_once, couchbeam:changes
   functions have been deprecated and are now replaced by
 couchbeam_changes:stream and couchbeam_changes:fetch functions.
+
+Bounded transport also refuses caller-supplied `path_encode_fun` options,
+validates multipart boundaries that become Content-Type headers, and checks
+header field names as HTTP tokens. Header values reject C0 controls except HT,
+and DEL; Latin-1 value bytes remain accepted. Name validation rejects raw C0
+and DEL before opening a bounded operation. Malformed header list tails receive
+`{unsafe_header, undefined}` before header preparation.

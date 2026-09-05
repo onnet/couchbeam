@@ -13,6 +13,8 @@
          bounded_encode_json/2, bounded_encode_json/3,
          new_request_budget/1,
          invalid_query_param/1,
+         request_line_safe/1,
+         addressable/1,
          cancel_request/1,
          request_identity/2,
          db_resp/2,
@@ -21,7 +23,8 @@
 -export_type([request_budget_spec/0, request_budget/0, request_identity/0]).
 
 -ifdef(TEST).
--export([decode_bounded_json/3, request_options/2]).
+-export([decode_bounded_json/3, request_options/2,
+         unsafe_header/1, unsafe_cookie/1, usable_method/1]).
 -endif.
 %% urls utils
 -export([server_url/1, db_url/1, doc_url/2]).
@@ -95,6 +98,9 @@ db_request(Method, Url, Headers, Body, Options, Expect) ->
 db_request_bounded(Method, Url, Headers, Body, Options, Expect,
                    #{'deadline_ms' := _, 'timeout_ms' := _,
                      'max_response_bytes' := _}=Budget) ->
+    %% The budget shape is checked first; the request line and the headers
+    %% are refused inside `request_bounded/7' (`unsafe_method',
+    %% `unsafe_url', `unsafe_header'), see `request_line_safe/1'.
     Resp = bounded_request(Method, Url, Headers, Body, Options, Budget),
     db_resp_bounded(Resp, Expect, Budget);
 db_request_bounded(_Method, _Url, _Headers, _Body, _Options, _Expect,
@@ -181,6 +187,15 @@ new_request_budget(_) ->
 %% non-list tail of an improper list, or the whole term when it is not a
 %% list. Walked by hand rather than through `lists:dropwhile/2', which has no
 %% clause for an improper tail.
+%%
+%% A line terminator (CR or LF) in either half of a pair is refused as well,
+%% see `request_line_safe/1'. For query pairs this refusal duplicates what
+%% `hackney_url:qs/1' does today (it percent-encodes both halves; `qs/1',
+%% `urlencode/2' and `pathencode/1' are byte-identical in hackney 1.20.1 and
+%% 1.25.0); it stands because whether a door can split a request must be a
+%% contract of the door, not a property of the dependency's encoder —
+%% GHSA-j9wq-vxxc-94wf / CVE-2026-47075 (`hackney_url:make_url/3' passing a
+%% raw query string through unencoded) is the class.
 -spec invalid_query_param(term()) -> 'undefined' | {'invalid_param', term()}.
 invalid_query_param([]) ->
     'undefined';
@@ -199,16 +214,102 @@ valid_query_param(_Entry) ->
     'false'.
 
 %% `hackney_bstr:to_binary/1' renders an atom with `atom_to_binary/2' in
-%% `latin1', so an atom is only as renderable as its name.
+%% `latin1', so an atom is only as renderable as its name. Renderable also
+%% means free of CR and LF, on every shape that carries characters.
 -spec renderable_query_term(term()) -> boolean().
-renderable_query_term(Term) when is_binary(Term); is_integer(Term) ->
+renderable_query_term(Term) when is_binary(Term); is_list(Term) ->
+    request_line_safe(Term);
+renderable_query_term(Term) when is_integer(Term) ->
     'true';
 renderable_query_term(Term) when is_atom(Term) ->
-    io_lib:latin1_char_list(atom_to_list(Term));
-renderable_query_term(Term) when is_list(Term) ->
-    io_lib:latin1_char_list(Term);
+    renderable_query_chars(atom_to_list(Term));
 renderable_query_term(_Term) ->
     'false'.
+
+%% @doc A term the doors may write into the request line: a binary or a
+%% Latin-1 string carrying neither CR nor LF — and only those two shapes.
+%% An iolist, a `#hackney_url{}' or a string beyond Latin-1, all of which
+%% hackney itself accepts, are refused here by design. This is the contract
+%% behind every address half a bounded call sends — the database name, the
+%% document id, the design and view names, a `list' function name, each
+%% query half — and, through `request_bounded/7', behind the URL of every
+%% bounded request, whether it comes from a door, from `db_request_bounded/7'
+%% or from a direct caller (the consumer's maintenance module builds its
+%% `_find'/`_bulk_docs' URLs itself). The method (`usable_method/1': letters
+%% only) and the headers (`header_half_safe/1': a half, or hackney's
+%% `{Value, Params}' form) narrow or widen it the way the wire does. A
+%% direct caller owns its path segments: by the time the transport door sees
+%% the URL a `?' in it is the query, so `addressable/1' is exported for such
+%% a caller to judge its database name with.
+%%
+%% Why the door checks and not the encoder: `hackney_url:make_url/3' joins
+%% path parts raw; `hackney_url:parse_url/1' then cuts the URL at the first
+%% `#' (the fragment is never sent) and at the first `?' (the rest is the
+%% query, sent as it is), and only the path half is percent-encoded
+%% (`hackney_url:pathencode/1', replaceable by the `path_encode_fun'
+%% request option) before the request line is written. The parser is
+%% spelled `parse_path'/`parse_fragment' in 1.20.1 and `cut_query'/
+%% `cut_fragment' in 1.25.0; for the URL shapes the doors build the two
+%% behave the same, and where they differ — a `?' inside the netloc, which
+%% is where the consumer keeps its credentials — no door writes. So a
+%% database, design or view name carrying `?' followed by a line terminator
+%% splits the request on the pinned hackney as it is; a document id survives
+%% only because `couchbeam_util:encode_docid/1' urlencodes it, a query half
+%% only because `hackney_url:qs/1' does, a header only for as long as its
+%% value carries none (`hackney_headers_new:to_iolist/1' writes
+%% `Name: Value' raw). The legacy doors, `couchbeam_view:show/4' with its raw
+%% `query_string' option and every other official entry point stay as
+%% official code leaves them: protected by those encoders alone.
+-spec request_line_safe(term()) -> boolean().
+request_line_safe(Term) when is_binary(Term) ->
+    'nomatch' =:= binary:match(Term, [<<"\r">>, <<"\n">>]);
+request_line_safe(Term) when is_list(Term) ->
+    renderable_query_chars(Term);
+request_line_safe(_Term) ->
+    'false'.
+
+%% @doc A term the doors may place into the request path as one segment: a
+%% non-empty `request_line_safe/1' term carrying none of `?', `#', `/', a
+%% space or a tab, and not a dot segment. `?', `#' and `/' re-address the
+%% request: hackney cuts the URL at `?' and `#', so `PUT /db#x/doc' reaches
+%% `/db' and creates a database and `GET /db?x/doc' answers the database
+%% with a query; `pathencode/1' keeps a slash, so `PUT /db/x/doc' writes an
+%% attachment of document `x' (Kazoo names its databases `account%2F…',
+%% percent-encoded, and that form passes); and an empty name — or one
+%% `fix_path/1' strips to empty, `/' — collapses the path (`PUT /doc'
+%% creates a database). A space or a tab is what the transport door refuses
+%% in the request line: judged here, the name is refused before any budget
+%% and not there, after one (on the view door, after the stream started).
+%% `.' and `..' pass `pathencode/1' as they are, and an intermediary that
+%% normalises dot segments re-addresses `PUT /../doc' to `/doc' — the same
+%% class as `/'. This is the contract of the database name, the design and
+%% view names and a `list' function name; a document id is urlencoded by
+%% `couchbeam_util:encode_docid/1' and keeps the wider `request_line_safe/1'
+%% contract.
+-spec addressable(term()) -> boolean().
+addressable(Term) when is_binary(Term); is_list(Term) ->
+    Term =/= <<>> andalso Term =/= []
+        andalso request_line_safe(Term)
+        andalso addressable_bytes(iolist_to_binary(Term));
+addressable(_Term) ->
+    'false'.
+
+-spec addressable_bytes(binary()) -> boolean().
+addressable_bytes(Bin) ->
+    Decoded = hackney_url:urldecode(Bin, 'skip'),
+    Decoded =/= <<".">> andalso Decoded =/= <<"..">>
+        andalso lists:all(fun(C) -> C >= 32 andalso C =/= 127 end,
+                          binary_to_list(Bin))
+        andalso 'nomatch' =:= binary:match(Bin, [<<"?">>, <<"#">>, <<"/">>,
+                                                <<" ">>, <<"\t">>]).
+
+%% `io_lib:latin1_char_list/1' answers `false' on anything but a flat list of
+%% Latin-1 characters, so the membership scans only ever run on one.
+-spec renderable_query_chars(list()) -> boolean().
+renderable_query_chars(Chars) ->
+    io_lib:latin1_char_list(Chars)
+        andalso not lists:member($\r, Chars)
+        andalso not lists:member($\n, Chars).
 
 %% @doc Read and decode the whole body of a bounded request `Ref' within
 %% `Budget'. Must run in the process that adopted `Ref' via
@@ -315,6 +416,17 @@ run_bounded_worker(WorkFun, ResultFun, Budget, TimeoutMs) ->
             flush_request_result(Token),
             {'error', 'timeout'}
     end.
+
+%% A caller-supplied multipart boundary is interpolated into Content-Type
+%% by hackney after its request headers have been prepared.
+-spec unsafe_body_header(term()) -> 'safe' | {'unsafe', binary()}.
+unsafe_body_header({'stream_multipart', _Size, Boundary}) ->
+    case is_binary(Boundary) andalso header_value_bytes(Boundary) of
+        'true' -> 'safe';
+        'false' -> {'unsafe', <<"Content-Type">>}
+    end;
+unsafe_body_header(_Body) ->
+    'safe'.
 
 %% @private Exported for `couchbeam_view_stream', not for consumers.
 %% @doc Bind an ephemeral worker's lifetime to `Parent'. A worker that is
@@ -528,12 +640,270 @@ request_bounded(Method, Url, Headers, Body, Options, Budget) ->
           {'ok', reference()} | {'error', term()}.
 request_bounded(Method, Url, Headers, Body, Options, Budget,
                 LifecycleOwner) ->
-    case follow_redirect_requested(Options) of
-        'true' -> {'error', {'unsupported_option', 'follow_redirect'}};
-        'false' ->
-            request_bounded_checked(Method, Url, Headers, Body, Options,
-                                    Budget, LifecycleOwner)
+    case unsafe_request_line(Method, Url) of
+        'undefined' ->
+            case follow_redirect_requested(Options) of
+                'true' ->
+                    {'error', {'unsupported_option', 'follow_redirect'}};
+                'false' ->
+                    case lists:keymember('proxy', 1, Options) of
+                        'true' -> {'error', {'unsupported_option', 'proxy'}};
+                        'false' ->
+                            case lists:keymember('path_encode_fun',
+                                                 1, Options) of
+                                'true' ->
+                                    {'error', {'unsupported_option',
+                                               'path_encode_fun'}};
+                                'false' ->
+                                    request_bounded_checked(
+                                      Method, Url, Headers, Body, Options,
+                                      Budget, LifecycleOwner)
+                            end
+                    end
+            end;
+        Refusal ->
+            {'error', Refusal}
     end.
+
+%% The last point before hackney, and the only one every bounded caller
+%% passes — the doors, `db_request_bounded/7' and a direct caller alike. A
+%% method or a URL that would split (CR/LF anywhere in it: base64 hides one
+%% in the credentials, nothing else does), truncate (`#': hackney cuts the
+%% URL at the first one wherever it sits and never sends the fragment) or
+%% malform (C0/DEL in the target, or SP/HT in the raw query) the request
+%% line is refused here. SP/HT in the path are also refused by policy:
+%% pathencode writes them as `+' / `%09', not as raw whitespace.
+%% Judged on what hackney writes after the method —
+%% `#hackney_url.raw_path', the path with the raw query and fragment — and
+%% not on the netloc, where the consumer keeps its CouchDB credentials raw:
+%% a password with a space becomes a `basic_auth' option and an
+%% `Authorization' header, never a byte of the request line. A URL
+%% `hackney_url:parse_url/1' cannot parse (on 1.25.0 `cut_query/1' cuts the
+%% whole URL at the first `?', a `?' inside the credentials included) is
+%% refused here rather than crashing the worker under a budget. The refusal
+%% names the URL by its path only, as `request_identity/2' names it.
+%% This netloc distinction requires direct connections: explicit proxy
+%% options are refused; callers must disable environment proxies with
+%% no_proxy_env when their environment configures one.
+-spec unsafe_request_line(term(), term()) ->
+          'undefined' | {'unsafe_method', term()} | {'unsafe_url', term()}.
+unsafe_request_line(Method, Url) ->
+    case usable_method(Method) of
+        'false' ->
+            {'unsafe_method', Method};
+        'true' ->
+            case request_line_safe(Url) andalso raw_path_usable(Url) of
+                'true' ->
+                    'undefined';
+                'false' ->
+                    {'unsafe_url',
+                     maps:get('path', request_identity(Method, Url))}
+            end
+    end.
+
+-spec raw_path_usable(binary() | string()) -> boolean().
+raw_path_usable(Url) ->
+    try hackney_url:parse_url(Url) of
+        #hackney_url{raw_path=RawPath} when is_binary(RawPath) ->
+            'nomatch' =:= binary:match(RawPath, [<<"#">>, <<" ">>])
+                andalso lists:all(fun(C) -> C >= 32 andalso C =/= 127 end,
+                                  binary_to_list(RawPath));
+        #hackney_url{} ->
+            'false'
+    catch
+        _Class:_Reason -> 'false'
+    end.
+
+%% A method hackney renders with `hackney_bstr:to_binary/1' and uppercases:
+%% an atom, a binary or a string of letters only, judged code point by code
+%% point (an atom is Unicode on OTP 27, and `atom_to_binary/2' with `latin1'
+%% raises on a code point above 255 where a refusal is due; a `$'-anchored
+%% regex lets a bare trailing LF through). A space or a tab in it re-parses
+%% the request target on a lenient server (`GET /x HTTP/1.1 /db …'), an
+%% integer is a nonsense token, and CR/LF splits the line.
+-spec usable_method(term()) -> boolean().
+usable_method(Method) when is_atom(Method) ->
+    letters_only(atom_to_list(Method));
+usable_method(Method) when is_binary(Method) ->
+    letters_only(binary_to_list(Method));
+usable_method(Method) when is_list(Method) ->
+    letters_only(Method);
+usable_method(_Method) ->
+    'false'.
+
+%% A non-empty, proper list of ASCII letters.
+-spec letters_only(term()) -> boolean().
+letters_only([]) ->
+    'false';
+letters_only(Chars) ->
+    letters_only_from(Chars).
+
+-spec letters_only_from(term()) -> boolean().
+letters_only_from([]) ->
+    'true';
+letters_only_from([C | Rest])
+  when is_integer(C), C >= $A, C =< $Z;
+       is_integer(C), C >= $a, C =< $z ->
+    letters_only_from(Rest);
+letters_only_from(_Other) ->
+    'false'.
+
+%% Every header hackney writes as `Name: Value' without validation, the ones
+%% this module adds included: `X-Kazoo-Log-ID' is the caller's call id,
+%% which the consumer sets from the request it serves — whether a given
+%% ingress lets a line terminator into it is that ingress's matter, the door
+%% judges the bytes it is given. Answers a pair by its name, never by its
+%% value, and an entry that is not a pair whole, under a tag no header name
+%% can collide with. A binary, a Latin-1 string or an iolist of them is a
+%% half, and so is hackney's parameterised value `{Value, Params}' when every
+%% part is (a parameter is a `{Key, Value}' pair or a bare key, as
+%% `hackney_headers_new:params_to_iolist/2' writes them); an atom or an
+%% integer renders as `hackney_bstr' renders it. A name is never the
+%% parameterised form: `to_iolist/1' lowercases it with
+%% `hackney_bstr:to_lower/1', which has no clause for a tuple.
+-spec unsafe_header(list()) -> 'safe' | {'unsafe', term()}.
+unsafe_header([]) ->
+    'safe';
+unsafe_header([{Name, Value} | Rest]) ->
+    case header_name_safe(Name) andalso header_half_safe(Value) of
+        'true' -> unsafe_header(Rest);
+        'false' -> {'unsafe', Name}
+    end;
+unsafe_header([Entry | _Rest]) ->
+    {'unsafe', Entry};
+unsafe_header(_Tail) ->
+    {'unsafe', 'undefined'}.
+
+-spec header_name_safe(term()) -> boolean().
+header_name_safe(Name) ->
+    header_scalar_safe(Name)
+        andalso begin
+                    Bin = hackney_bstr:to_binary(Name),
+                    Bin =/= <<>> andalso lists:all(fun header_token/1,
+                                                   binary_to_list(Bin))
+                end.
+
+-spec header_token(byte()) -> boolean().
+header_token(C) ->
+    (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z)
+        orelse (C >= $0 andalso C =< $9)
+        orelse lists:member(C, "!#$%&'*+-.^_`|~").
+
+-spec header_value_bytes(binary()) -> boolean().
+header_value_bytes(Bin) ->
+    lists:all(fun(C) -> C =:= 9 orelse (C >= 32 andalso C =/= 127) end,
+              binary_to_list(Bin)).
+
+%% The `cookie' request option becomes a `Cookie' header inside hackney
+%% (`hackney_request:maybe_add_cookies/2'), after any header scan. A binary
+%% is written as it is. `{Name, Value}' and `{Name, Value, Opts}' go through
+%% `hackney_cookie:setcookie/3', which refuses — a `badmatch' inside the
+%% killable worker, after the budget started — a name carrying `=', `,',
+%% `;', a space, a tab, CR, LF, VT or FF and a value carrying any of those
+%% but `=', takes each setcookie half as iodata (an atom raises there),
+%% and writes the
+%% `domain' and `path' options raw after `; Domain=' and `; Path='. A list
+%% holds those shapes, each written as its own header. Every shape is judged
+%% here, before any budget, by what hackney would write or refuse.
+-spec unsafe_cookie(list()) -> 'safe' | {'unsafe', binary()}.
+unsafe_cookie(Options) ->
+    case cookie_safe(proplists:get_value('cookie', Options, [])) of
+        'true' -> 'safe';
+        'false' -> {'unsafe', <<"Cookie">>}
+    end.
+
+-define(COOKIE_VALUE_REFUSED, [<<",">>, <<";">>, <<" ">>, <<"\t">>,
+                               <<"\r">>, <<"\n">>, <<"\v">>, <<"\f">>]).
+
+-spec cookie_safe(term()) -> boolean().
+cookie_safe(Cookie) when is_binary(Cookie) ->
+    header_half_safe(Cookie);
+cookie_safe({Name, Value}) ->
+    cookie_pair_safe(Name, Value, []);
+cookie_safe({Name, Value, Opts}) ->
+    cookie_pair_safe(Name, Value, Opts);
+cookie_safe(Cookies) when is_list(Cookies) ->
+    cookie_list_safe(Cookies);
+cookie_safe(_Other) ->
+    'false'.
+
+-spec cookie_list_safe(term()) -> boolean().
+cookie_list_safe([]) ->
+    'true';
+cookie_list_safe([Cookie | Rest]) when is_binary(Cookie); is_tuple(Cookie) ->
+    cookie_safe(Cookie) andalso cookie_list_safe(Rest);
+cookie_list_safe(_Other) ->
+    'false'.
+
+-spec cookie_pair_safe(term(), term(), term()) -> boolean().
+cookie_pair_safe(Name, Value, Opts) ->
+    cookie_half_safe(Name, [<<"=">> | ?COOKIE_VALUE_REFUSED])
+        andalso cookie_half_safe(Value, ?COOKIE_VALUE_REFUSED)
+        andalso cookie_opts_safe(Opts).
+
+-spec cookie_half_safe(term(), [binary()]) -> boolean().
+cookie_half_safe(Half, Refused) when is_binary(Half); is_list(Half) ->
+    header_half_safe(Half)
+        andalso 'nomatch' =:= binary:match(iolist_to_binary(Half), Refused);
+cookie_half_safe(_Half, _Refused) ->
+    'false'.
+
+%% Scan the list directly: keyfind accepts larger tuples and raises on
+%% improper lists. Unknown options are ignored by setcookie; known options
+%% must have the shapes its rendering clauses accept.
+-spec cookie_opts_safe(term()) -> boolean().
+cookie_opts_safe([]) ->
+    'true';
+cookie_opts_safe([{Key, Value} | Rest]) ->
+    cookie_opt_safe(Key, Value) andalso cookie_opts_safe(Rest);
+cookie_opts_safe([Other | Rest]) when is_tuple(Other), tuple_size(Other) > 0 ->
+    not lists:member(element(1, Other),
+                     ['domain', 'path', 'secure', 'http_only', 'max_age'])
+        andalso cookie_opts_safe(Rest);
+cookie_opts_safe([_Ignored | Rest]) ->
+    cookie_opts_safe(Rest);
+cookie_opts_safe(_Opts) ->
+    'false'.
+
+-spec cookie_opt_safe(term(), term()) -> boolean().
+cookie_opt_safe(Key, Value) when Key =:= 'secure'; Key =:= 'http_only' ->
+    Value =:= 'true';
+cookie_opt_safe('max_age', Value) ->
+    is_integer(Value) andalso Value >= 0;
+cookie_opt_safe(Key, Value) when Key =:= 'domain'; Key =:= 'path' ->
+    (is_binary(Value) orelse is_list(Value)) andalso header_scalar_safe(Value);
+cookie_opt_safe(_Key, _Value) ->
+    'true'.
+
+-spec header_half_safe(term()) -> boolean().
+header_half_safe({Value, Params}) when is_list(Params) ->
+    header_scalar_safe(Value) andalso header_params_safe(Params);
+header_half_safe(Term) ->
+    header_scalar_safe(Term).
+
+-spec header_scalar_safe(term()) -> boolean().
+header_scalar_safe(Term) when is_binary(Term); is_list(Term) ->
+    try iolist_to_binary(Term) of
+        Bin -> header_value_bytes(Bin)
+    catch
+        'error':'badarg' -> 'false'
+    end;
+header_scalar_safe(Term) when is_atom(Term); is_integer(Term) ->
+    renderable_query_term(Term)
+        andalso header_value_bytes(hackney_bstr:to_binary(Term));
+header_scalar_safe(_Term) ->
+    'false'.
+
+-spec header_params_safe(term()) -> boolean().
+header_params_safe([]) ->
+    'true';
+header_params_safe([{K, V} | Rest]) ->
+    header_scalar_safe(K) andalso header_scalar_safe(V)
+        andalso header_params_safe(Rest);
+header_params_safe([K | Rest]) when not is_tuple(K) ->
+    header_scalar_safe(K) andalso header_params_safe(Rest);
+header_params_safe(_Other) ->
+    'false'.
 
 %% A redirect makes `hackney' emit `redirect'/`see_other' control messages the
 %% bounded reader has no clause for, and it re-targets the request at a host
@@ -548,6 +918,17 @@ follow_redirect_requested(Options) ->
           {'ok', reference()} | {'error', term()}.
 request_bounded_checked(Method, Url, Headers, Body, Options, Budget,
                         LifecycleOwner) ->
+    case unsafe_header(Headers) of
+        {'unsafe', Name} -> {'error', {'unsafe_header', Name}};
+        'safe' -> request_bounded_headers_checked(
+                    Method, Url, Headers, Body, Options, Budget, LifecycleOwner)
+    end.
+
+-spec request_bounded_headers_checked(term(), term(), list(), term(), list(),
+                                      request_budget(), pid()) ->
+          {'ok', reference()} | {'error', term()}.
+request_bounded_headers_checked(Method, Url, Headers, Body, Options, Budget,
+                                LifecycleOwner) ->
     Parent = self(),
     Token = make_ref(),
     Hooks = test_hooks(Options),
@@ -558,16 +939,38 @@ request_bounded_checked(Method, Url, Headers, Body, Options, Budget,
                             'stream_to', strip_test_options(Options)))],
     case prepare_request(Method, Url, Headers, RequestOptions, Budget) of
         {'ok', FinalHeaders, FinalOptions} ->
-            RequestFun = fun() ->
-                                 request_prepared(
-                                   Method, Url, FinalHeaders, Body,
-                                   FinalOptions)
-                         end,
-            request_bounded_prepared(
-              Parent, LifecycleOwner, Token, RequestFun, Hooks, Budget,
-              request_identity(Method, Url));
+            %% Checked after `prepare_request/5': the Kazoo headers it adds
+            %% are as caller-controlled as the ones handed in, and so is the
+            %% `Cookie' header hackney will add from the options.
+            case unsafe_wire_header(FinalHeaders, FinalOptions, Body) of
+                'safe' ->
+                    RequestFun = fun() ->
+                                         request_prepared(
+                                           Method, Url, FinalHeaders, Body,
+                                           FinalOptions)
+                                 end,
+                    request_bounded_prepared(
+                      Parent, LifecycleOwner, Token, RequestFun, Hooks,
+                      Budget, request_identity(Method, Url));
+                {'unsafe', Name} ->
+                    {'error', {'unsafe_header', Name}}
+            end;
         {'error', _}=Error ->
             Error
+    end.
+
+%% The headers in the order hackney writes them: the caller's and the ones
+%% `prepare_request/5' added, then the `Cookie' header it makes from the
+%% `cookie' option (`hackney_request:maybe_add_cookies/2').
+-spec unsafe_wire_header(list(), list(), term()) -> 'safe' | {'unsafe', term()}.
+unsafe_wire_header(Headers, Options, Body) ->
+    case unsafe_header(Headers) of
+        'safe' ->
+            case unsafe_cookie(Options) of
+                'safe' -> unsafe_body_header(Body);
+                UnsafeCookie -> UnsafeCookie
+            end;
+        {'unsafe', _Name}=Unsafe -> Unsafe
     end.
 
 %% @private Exported for `couchbeam_view_stream', not for consumers.

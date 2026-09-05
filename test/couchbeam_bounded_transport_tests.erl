@@ -3,7 +3,7 @@
 %%%
 %%%     rebar3 as test eunit --module=couchbeam_bounded_transport_tests
 %%%
-%%% Wall time is about 35–40 s on a loopback: the long scenarios live in
+%%% Wall time is about 42 s on a loopback: the long scenarios live in
 %%% `{timeout, 30, ...}' generators (pauses of 10.2 s, 7 s and 5 s pin the
 %%% legacy inter-chunk wait and the deadline verdicts), the rest finish in
 %%% milliseconds. Which scenario has to be a generator is not left to
@@ -19,10 +19,11 @@
 %%% full `rebar3 as test eunit' run, on the official base as well. The whole
 %%% module runs in one eunit process, so shared state is the hazard: the
 %%% scenarios that need a clean mailbox empty it themselves
-%%% (`drain_transport_messages/0' — 50 of the 202 scenarios, there is no fixture
-%%% doing it for the rest), and the ones that park the shared `hackney_manager' go
+%%% (`drain_transport_messages/0'; there is no fixture doing it for the rest),
+%%% and the ones that park the shared `hackney_manager' go
 %%% through `suspend_manager/0', whose watcher resumes it even when the
 %%% scenario is killed without running its `after'.
+%%% Snapshot 2026-09-05: test inventory is recorded in the chain output.
 -module(couchbeam_bounded_transport_tests).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -4750,6 +4751,844 @@ bounded_fetch_refuses_unrenderable_string_option_key_test() ->
                 Db, 'all_docs', [{[1000], <<"x">>}], {1000, 1024})
       end).
 
+%% CVE-2026-47075 (hackney < 4.0.1): `hackney_url:make_url/3' passes a raw
+%% query string through unencoded, so a CR/LF in it splits the request. The
+%% doors hand hackney `{Key, Value}' pairs, which `hackney_url:qs/1'
+%% percent-encodes (measured on 1.20.1 and 1.25.0: the wire carries
+%% `%0D%0A'), so the bytes do not reach the request line today. The refusal
+%% makes that a contract of the door instead of a property of the
+%% dependency's encoder, on every shape the scan renders; a tab, a space or
+%% a percent sign is data and stays accepted.
+invalid_query_param_refuses_line_terminators_test_() ->
+    Injected = <<"1-x\r\nX-Injected: yes">>,
+    [?_assertEqual('undefined',
+                   couchbeam_httpc:invalid_query_param(
+                     [{'rev', <<"1-x y%z\t">>}, {'k', "a b"}, {'n', 1}])),
+     ?_assertEqual({'invalid_param', {'rev', Injected}},
+                   couchbeam_httpc:invalid_query_param([{'rev', Injected}])),
+     ?_assertEqual({'invalid_param', {'rev', <<"1\r">>}},
+                   couchbeam_httpc:invalid_query_param([{'rev', <<"1\r">>}])),
+     ?_assertEqual({'invalid_param', {'rev', <<"1\n">>}},
+                   couchbeam_httpc:invalid_query_param([{'rev', <<"1\n">>}])),
+     ?_assertEqual({'invalid_param', {<<"re\nv">>, <<"1">>}},
+                   couchbeam_httpc:invalid_query_param(
+                     [{<<"re\nv">>, <<"1">>}])),
+     ?_assertEqual({'invalid_param', {'rev', "1\r\n"}},
+                   couchbeam_httpc:invalid_query_param([{'rev', "1\r\n"}])),
+     ?_assertEqual({'invalid_param', {'re\nv', <<"1">>}},
+                   couchbeam_httpc:invalid_query_param([{'re\nv', <<"1">>}])),
+     ?_assertEqual({'invalid_param', {'rev', 'o\rk'}},
+                   couchbeam_httpc:invalid_query_param([{'rev', 'o\rk'}]))].
+
+bounded_open_doc_refuses_crlf_in_param_value_test() ->
+    Injected = <<"1-x\r\nX-Injected: yes">>,
+    assert_refused_before_transport(
+      {'error', {'invalid_param', {'rev', Injected}}},
+      fun(Db) ->
+              couchbeam:open_doc_bounded(
+                Db, <<"doc">>, [{'rev', Injected}], {1000, 1024})
+      end).
+
+bounded_save_doc_refuses_lf_in_option_key_test() ->
+    assert_refused_before_transport(
+      {'error', {'invalid_param', {<<"batch\n">>, <<"ok">>}}},
+      fun(Db) ->
+              couchbeam:save_doc_bounded(
+                Db, {[{<<"_id">>, <<"doc">>}]}, [{<<"batch\n">>, <<"ok">>}],
+                {1000, 1024})
+      end).
+
+bounded_fetch_refuses_cr_in_view_option_value_test() ->
+    ensure_couchbeam_supervisor(),
+    assert_refused_before_transport(
+      {'error', {'invalid_param', {'startkey_docid', <<"a\rb">>}}},
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(
+                Db, 'all_docs', [{'startkey_docid', <<"a\rb">>}],
+                {1000, 1024})
+      end).
+
+%% The scan names the first offending entry, refuses an improper half
+%% without crashing on it (`andalso' stops before `lists:member/2'), and
+%% covers a Latin-1 string key like every other shape.
+invalid_query_param_names_the_first_line_terminated_entry_test_() ->
+    [?_assertEqual({'invalid_param', {'rev', <<"a\rb">>}},
+                   couchbeam_httpc:invalid_query_param(
+                     [{'ok', <<"1">>}, {'rev', <<"a\rb">>}, {'k', "x\n"}])),
+     ?_assertEqual({'invalid_param', {"re\nv", <<"1">>}},
+                   couchbeam_httpc:invalid_query_param([{"re\nv", <<"1">>}])),
+     ?_assertEqual({'invalid_param', {'rev', [$a | $b]}},
+                   couchbeam_httpc:invalid_query_param([{'rev', [$a | $b]}]))].
+
+%% What the accepted shapes look like on the wire: a space, a percent sign
+%% and a tab are data and travel percent-encoded (`hackney_url:qs/1').
+bounded_open_doc_sends_accepted_param_shapes_encoded_test() ->
+    assert_bounded_request_line(
+      <<"GET /db/doc?rev=1-x+y%25z%09 HTTP/1.1">>,
+      <<"{\"_id\":\"doc\",\"_rev\":\"1-x\"}">>,
+      fun(Db) ->
+              couchbeam:open_doc_bounded(
+                Db, <<"doc">>, [{'rev', <<"1-x y%z\t">>}], {1000, 1024})
+      end).
+
+%% The view door scans the PARSED pairs: a control character inside a `key'
+%% is JSON-escaped by the parser (`couchbeam_ejson:encode/1' → `\n', two
+%% characters), so it is not a line terminator any more and the request is
+%% sent, with the escaped form percent-encoded.
+bounded_fetch_sends_json_escaped_control_char_in_key_test() ->
+    ensure_couchbeam_supervisor(),
+    assert_bounded_request_line(
+      <<"GET /db/_all_docs?startkey=%22a%5Cnb%22 HTTP/1.1">>,
+      <<"{\"total_rows\":0,\"offset\":0,\"rows\":[]}">>,
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(
+                Db, 'all_docs', [{'startkey', <<"a\nb">>}], {1000, 4096})
+      end).
+
+%% The legacy door has no scan: on it the line terminator reaches the wire
+%% percent-encoded, by `hackney_url:qs/1' alone. This is the encoder property
+%% the bounded doors refuse to rest on, observed rather than asserted.
+legacy_open_doc_leaves_line_terminators_to_the_encoder_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    drain_transport_messages(),
+    with_http_request_server(
+      fun(Socket, Request, Parent) ->
+              assert_request_line(
+                <<"GET /db/doc?rev=a%0D%0Ab HTTP/1.1">>, Request),
+              send_json_response(Socket, <<"{\"_id\":\"doc\"}">>),
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl, [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              ?assertMatch({'ok', _},
+                           couchbeam:open_doc(
+                             Db, <<"doc">>, [{'rev', <<"a\r\nb">>}]))
+      end).
+
+%% The path halves. On the pinned hackney (1.25.0; the parser is spelled
+%% `parse_path'/`parse_fragment' in 1.20.1 and behaves the same, `qs/1',
+%% `urlencode/2' and `pathencode/1' are byte-identical) a database, design
+%% or view name carrying `?' and then CR/LF lands on the request line raw —
+%% `GET /db?x HTTP/1.1\r\nX-Injected: yes\r\nX:/doc HTTP/1.1' — because
+%% hackney cuts the URL at the first `?' and encodes only the path half;
+%% `legacy_db_info_leaves_the_path_split_to_the_encoder_test' observes it. A
+%% document id is urlencoded by `couchbeam_util:encode_docid/1'; the door
+%% refuses it under the same contract rather than rest on that.
+bounded_db_info_refuses_db_name_with_line_terminator_test() ->
+    Name = <<"db?x HTTP/1.1\r\nX-Injected: yes\r\nX:">>,
+    assert_refused_before_transport(
+      {'error', {'unsafe_db_name', Name}},
+      fun(Db) ->
+              couchbeam:db_info_bounded(Db#db{name=Name}, {1000, 1024})
+      end).
+
+bounded_open_doc_refuses_db_name_with_line_terminator_test() ->
+    Name = <<"db?x\nX: y">>,
+    assert_refused_before_transport(
+      {'error', {'unsafe_db_name', Name}},
+      fun(Db) ->
+              couchbeam:open_doc_bounded(
+                Db#db{name=Name}, <<"doc">>, [], {1000, 1024})
+      end).
+
+bounded_save_doc_refuses_db_name_with_line_terminator_test() ->
+    Name = <<"db\r">>,
+    assert_refused_before_transport(
+      {'error', {'unsafe_db_name', Name}},
+      fun(Db) ->
+              couchbeam:save_doc_bounded(
+                Db#db{name=Name}, {[{<<"_id">>, <<"doc">>}]}, [],
+                {1000, 1024})
+      end).
+
+bounded_fetch_refuses_db_name_with_line_terminator_test() ->
+    ensure_couchbeam_supervisor(),
+    Name = <<"db?x\r\nX: y">>,
+    assert_refused_before_transport(
+      {'error', {'unsafe_db_name', Name}},
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(
+                Db#db{name=Name}, 'all_docs', [], {1000, 4096})
+      end).
+
+bounded_open_doc_refuses_doc_id_with_line_terminator_test() ->
+    assert_refused_before_transport(
+      {'error', 'missing_doc_id'},
+      fun(Db) ->
+              couchbeam:open_doc_bounded(
+                Db, <<"doc\r\nX: y">>, [], {1000, 1024})
+      end).
+
+bounded_open_doc_refuses_string_doc_id_with_line_terminator_test() ->
+    assert_refused_before_transport(
+      {'error', 'missing_doc_id'},
+      fun(Db) ->
+              couchbeam:open_doc_bounded(Db, "doc\n", [], {1000, 1024})
+      end).
+
+bounded_save_doc_refuses_id_with_line_terminator_test() ->
+    assert_refused_before_transport(
+      {'error', 'missing_doc_id'},
+      fun(Db) ->
+              couchbeam:save_doc_bounded(
+                Db, {[{<<"_id">>, <<"doc\nX: y">>}]}, [], {1000, 1024})
+      end).
+
+bounded_fetch_refuses_design_name_with_line_terminator_test() ->
+    ensure_couchbeam_supervisor(),
+    ViewName = {<<"d?x HTTP/1.1\r\nX-Injected: yes\r\nX:">>, <<"v">>},
+    assert_refused_before_transport(
+      {'error', {'invalid_view_name', ViewName}},
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(Db, ViewName, [], {1000, 4096})
+      end).
+
+bounded_fetch_refuses_view_name_with_line_terminator_test() ->
+    ensure_couchbeam_supervisor(),
+    ViewName = {<<"d">>, "v\n"},
+    assert_refused_before_transport(
+      {'error', {'invalid_view_name', ViewName}},
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(Db, ViewName, [], {1000, 4096})
+      end).
+
+%% A space, a tab or a dot segment in a name is refused at the door, before
+%% any budget — not at the transport door after one (on the view door, after
+%% the stream started).
+bounded_doors_refuse_names_with_a_space_a_tab_or_a_dot_segment_test_() ->
+    [{"db_info: " ++ Label,
+      ?_assertEqual({'error', {'unsafe_db_name', Name}},
+                    refused_before_transport(
+                      fun(Db) ->
+                              couchbeam:db_info_bounded(Db#db{name=Name},
+                                                        {1000, 1024})
+                      end, []))}
+     || {Label, Name} <- [{"space", <<"db x">>}, {"tab", "db\tx"},
+                          {"dot", <<".">>}, {"dot dot", ".."}]]
+    ++
+    [{"open_doc: " ++ Label,
+      ?_assertEqual({'error', {'unsafe_db_name', Name}},
+                    refused_before_transport(
+                      fun(Db) ->
+                              couchbeam:open_doc_bounded(
+                                Db#db{name=Name}, <<"doc">>, [], {1000, 1024})
+                      end, []))}
+     || {Label, Name} <- [{"space", <<"db x">>}, {"dot dot", <<"..">>}]]
+    ++
+    [{"save_doc: " ++ Label,
+      ?_assertEqual({'error', {'unsafe_db_name', Name}},
+                    refused_before_transport(
+                      fun(Db) ->
+                              couchbeam:save_doc_bounded(
+                                Db#db{name=Name}, {[{<<"_id">>, <<"doc">>}]},
+                                [], {1000, 1024})
+                      end, []))}
+     || {Label, Name} <- [{"tab", <<"db\tx">>}, {"dot", "."}]]
+    ++
+    [{"fetch, view half: " ++ Label,
+      fun() ->
+              ensure_couchbeam_supervisor(),
+              ?assertEqual({'error', {'invalid_view_name', ViewName}},
+                           refused_before_transport(
+                             fun(Db) ->
+                                     couchbeam_view:fetch_bounded(
+                                       Db, ViewName, [], {1000, 4096})
+                             end, []))
+      end}
+     || {Label, ViewName} <- [{"space in the design name",
+                              {<<"d x">>, <<"v">>}},
+                              {"tab in the view name", {<<"d">>, "v\tx"}},
+                              {"dot design name", {<<".">>, <<"v">>}},
+                              {"dot dot view name", {<<"d">>, <<"..">>}}]].
+
+%% `{list, Name}' goes into the path of a `{Design, View}' request; a name
+%% `hackney_url:fix_path/1' has no clause for (integer, atom) would crash
+%% after the budget clock started, a `?'/`#' would re-address it, a
+%% line-terminated one would split it (that one the query scan refuses
+%% first: the parser keeps the pair as a query half too).
+bounded_fetch_refuses_unusable_list_name_test_() ->
+    [{Label,
+      fun() ->
+              ensure_couchbeam_supervisor(),
+              assert_refused_before_transport(
+                {'error', {'invalid_param', {'list', Name}}},
+                fun(Db) ->
+                        couchbeam_view:fetch_bounded(
+                          Db, {<<"d">>, <<"v">>}, [{'list', Name}],
+                          {1000, 4096})
+                end)
+      end}
+     || {Label, Name} <- [{"integer", 42},
+                          {"atom", 'l'},
+                          {"question mark", <<"l?x">>},
+                          {"slash", <<"l/x">>},
+                          {"line terminator", <<"l\r">>}]].
+
+%% What `make_view/4' would read through `proplists:get_value/2': a bare
+%% `list' atom is `true' to it (`fix_path(true)' crashes after the budget), a
+%% `list'-keyed tuple of another size is dropped by the parser. Both are
+%% refused by the entry as passed.
+bounded_fetch_refuses_malformed_list_entries_test_() ->
+    [{Label,
+      fun() ->
+              ensure_couchbeam_supervisor(),
+              assert_refused_before_transport(
+                {'error', {'invalid_param', Entry}},
+                fun(Db) ->
+                        couchbeam_view:fetch_bounded(
+                          Db, {<<"d">>, <<"v">>}, [{'limit', 1}, Entry],
+                          {1000, 4096})
+                end)
+      end}
+     || {Label, Entry} <- [{"bare atom", 'list'},
+                           {"three-tuple", {'list', 'a', 'b'}}]].
+
+%% The positive control for the guard above: a list name that is one path
+%% segment reaches the wire in the path (and, as the parser keeps the pair,
+%% in the query too); on `all_docs' it is never placed into the path, so it
+%% is only a query half there and an integer passes the door.
+bounded_fetch_sends_usable_list_name_in_the_path_test() ->
+    ensure_couchbeam_supervisor(),
+    assert_bounded_request_line(
+      <<"GET /db/_design/d/_list/l/v?list=l HTTP/1.1">>,
+      <<"{\"total_rows\":0,\"offset\":0,\"rows\":[]}">>,
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(
+                Db, {<<"d">>, <<"v">>}, [{'list', <<"l">>}], {1000, 4096})
+      end).
+
+bounded_fetch_all_docs_sends_list_option_as_a_query_half_test() ->
+    ensure_couchbeam_supervisor(),
+    assert_bounded_request_line(
+      <<"GET /db/_all_docs?list=42 HTTP/1.1">>,
+      <<"{\"total_rows\":0,\"offset\":0,\"rows\":[]}">>,
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(
+                Db, 'all_docs', [{'list', 42}], {1000, 4096})
+      end).
+
+%% Atom halves are refused by the door, not left to `hackney_url:fix_path/1'
+%% after the budget: the address scan and the query scan disagree on atoms
+%% (a query half renders an atom, a path segment does not).
+bounded_fetch_refuses_atom_design_name_half_test() ->
+    ensure_couchbeam_supervisor(),
+    ViewName = {'d', <<"v">>},
+    assert_refused_before_transport(
+      {'error', {'invalid_view_name', ViewName}},
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(Db, ViewName, [], {1000, 4096})
+      end).
+
+%% `?', `#' and emptiness re-address the request without any line
+%% terminator: hackney cuts the URL at either character, and an empty
+%% segment collapses the path — `PUT /doc' would create a database.
+bounded_doors_refuse_db_names_that_are_not_one_path_segment_test_() ->
+    [{Label,
+      fun() ->
+              ensure_couchbeam_supervisor(),
+              assert_refused_before_transport(
+                {'error', {'unsafe_db_name', Name}},
+                fun(Db) -> Call(Db#db{name=Name}) end)
+      end}
+     || {Label, Name, Call} <-
+            [{"db_info: empty", <<>>,
+              fun(Db) -> couchbeam:db_info_bounded(Db, {1000, 1024}) end},
+             {"open_doc: hash", <<"db#x">>,
+              fun(Db) ->
+                      couchbeam:open_doc_bounded(Db, <<"doc">>, [],
+                                                 {1000, 1024})
+              end},
+             {"save_doc: question mark", <<"db?x">>,
+              fun(Db) ->
+                      couchbeam:save_doc_bounded(
+                        Db, {[{<<"_id">>, <<"doc">>}]}, [], {1000, 1024})
+              end},
+             {"fetch: string with hash", "db#x",
+              fun(Db) ->
+                      couchbeam_view:fetch_bounded(Db, 'all_docs', [],
+                                                   {1000, 4096})
+              end}]].
+
+%% A slash in a segment re-addresses the request (`pathencode/1' keeps it);
+%% Kazoo's percent-encoded database names (`account%2F…') are one segment
+%% and pass, as the wire shows.
+bounded_open_doc_refuses_slash_in_db_name_test() ->
+    Name = <<"db/x">>,
+    assert_refused_before_transport(
+      {'error', {'unsafe_db_name', Name}},
+      fun(Db) ->
+              couchbeam:open_doc_bounded(
+                Db#db{name=Name}, <<"doc">>, [], {1000, 1024})
+      end).
+
+bounded_fetch_refuses_slash_in_design_name_test() ->
+    ensure_couchbeam_supervisor(),
+    ViewName = {<<"d/x">>, <<"v">>},
+    assert_refused_before_transport(
+      {'error', {'invalid_view_name', ViewName}},
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(Db, ViewName, [], {1000, 4096})
+      end).
+
+bounded_open_doc_sends_a_percent_encoded_db_name_as_one_segment_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    drain_transport_messages(),
+    with_http_request_server(
+      fun(Socket, Request, Parent) ->
+              assert_request_line(
+                <<"GET /account%2Fab%2Fcd%2Fef/doc HTTP/1.1">>, Request),
+              send_json_response(Socket, <<"{\"_id\":\"doc\"}">>),
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl, [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(
+                             Server, <<"account%2Fab%2Fcd%2Fef">>),
+              ?assertMatch({'ok', _, _},
+                           couchbeam:open_doc_bounded(
+                             Db, <<"doc">>, [], {1000, 1024})),
+              assert_success_left_nothing_behind()
+      end).
+
+%% `?' and `#' alone re-address a view request the same way they do a
+%% database: `GET /db/_design/d?x/_view/v' answers the design document.
+bounded_fetch_refuses_view_name_halves_that_are_not_one_segment_test_() ->
+    [{Label,
+      fun() ->
+              ensure_couchbeam_supervisor(),
+              assert_refused_before_transport(
+                {'error', {'invalid_view_name', ViewName}},
+                fun(Db) ->
+                        couchbeam_view:fetch_bounded(Db, ViewName, [],
+                                                     {1000, 4096})
+                end)
+      end}
+     || {Label, ViewName} <- [{"design: question mark", {<<"d?x">>, <<"v">>}},
+                              {"view: hash", {<<"d">>, <<"v#x">>}},
+                              {"design: string with hash", {"d#x", <<"v">>}}]].
+
+%% The document id keeps the wider contract on purpose: `?' and `#' in it
+%% are urlencoded by `couchbeam_util:encode_docid/1' and address the
+%% document, not a query or a fragment.
+bounded_open_doc_sends_an_encoded_doc_id_with_query_characters_test() ->
+    assert_bounded_request_line(
+      <<"GET /db/doc%3Fx%23y HTTP/1.1">>,
+      <<"{\"_id\":\"doc?x#y\"}">>,
+      fun(Db) ->
+              couchbeam:open_doc_bounded(Db, <<"doc?x#y">>, [], {1000, 1024})
+      end).
+
+bounded_fetch_refuses_empty_view_name_half_test() ->
+    ensure_couchbeam_supervisor(),
+    ViewName = {<<"d">>, <<>>},
+    assert_refused_before_transport(
+      {'error', {'invalid_view_name', ViewName}},
+      fun(Db) ->
+              couchbeam_view:fetch_bounded(Db, ViewName, [], {1000, 4096})
+      end).
+
+%% The order of refusals is a contract, not a comment: the database name is
+%% judged before the document, the view and the budget spec.
+bounded_doors_refuse_the_db_name_before_anything_else_test_() ->
+    Name = <<"db\r">>,
+    [{"open_doc: before the doc id",
+      ?_assertEqual({'error', {'unsafe_db_name', Name}},
+                    refused_before_transport(
+                      fun(Db) ->
+                              couchbeam:open_doc_bounded(
+                                Db#db{name=Name}, <<>>, [], {1000, 1024})
+                      end, []))},
+     {"db_info: before the budget spec",
+      ?_assertEqual({'error', {'unsafe_db_name', Name}},
+                    refused_before_transport(
+                      fun(Db) ->
+                              couchbeam:db_info_bounded(Db#db{name=Name},
+                                                        'bogus')
+                      end, []))},
+     {"save_doc: before the document shape",
+      ?_assertEqual({'error', {'unsafe_db_name', Name}},
+                    refused_before_transport(
+                      fun(Db) ->
+                              couchbeam:save_doc_bounded(
+                                Db#db{name=Name}, 'not_a_doc', [],
+                                {1000, 1024})
+                      end, []))},
+     {"fetch: before the view name",
+      fun() ->
+              ensure_couchbeam_supervisor(),
+              ?assertEqual({'error', {'unsafe_db_name', Name}},
+                           refused_before_transport(
+                             fun(Db) ->
+                                     couchbeam_view:fetch_bounded(
+                                       Db#db{name=Name}, 'bogus', [],
+                                       {1000, 4096})
+                             end, []))
+      end}].
+
+%% A first argument that is not a `#db{}' is a `function_clause' on every
+%% door: the type is the contract.
+bounded_doors_do_not_accept_a_non_db_first_argument_test_() ->
+    [?_assertError('function_clause',
+                   couchbeam:db_info_bounded('not_a_db', {1000, 1024})),
+     ?_assertError('function_clause',
+                   couchbeam:open_doc_bounded('not_a_db', <<"doc">>, [],
+                                              {1000, 1024})),
+     ?_assertError('function_clause',
+                   couchbeam:save_doc_bounded('not_a_db',
+                                              {[{<<"_id">>, <<"doc">>}]},
+                                              [], {1000, 1024})),
+     ?_assertError('function_clause',
+                   couchbeam_view:fetch_bounded('not_a_db', 'all_docs', [],
+                                                {1000, 4096}))].
+
+%% What the doors refuse, observed on a legacy door: the split lands on the
+%% wire, and the injected line arrives at the server as a header of its own.
+legacy_db_info_leaves_the_path_split_to_the_encoder_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    drain_transport_messages(),
+    with_http_request_server(
+      fun(Socket, Request, Parent) ->
+              assert_request_line(<<"GET /db?x HTTP/1.1">>, Request),
+              assert_request_header(<<"X-Injected">>, <<"yes">>, Request),
+              send_json_response(Socket, <<"{\"db_name\":\"db\"}">>),
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl, [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(
+                             Server,
+                             <<"db?x HTTP/1.1\r\nX-Injected: yes\r\nX:">>),
+              ?assertMatch({'ok', _}, couchbeam:db_info(Db))
+      end).
+
+%% The two predicates the doors are built on, by shape.
+request_line_safe_and_addressable_by_shape_test_() ->
+    Safe = fun couchbeam_httpc:request_line_safe/1,
+    Addr = fun couchbeam_httpc:addressable/1,
+    [?_assert(Safe(<<"db">>)), ?_assert(Safe("db")), ?_assert(Safe(<<>>)),
+     ?_assert(Safe(<<"a b?c#d/e">>)), ?_assert(Safe("\351")),
+     ?_assertNot(Safe(<<"a\rb">>)), ?_assertNot(Safe("a\n")),
+     ?_assertNot(Safe(["d", <<"b">>])), ?_assertNot(Safe([1000])),
+     ?_assertNot(Safe('db')), ?_assertNot(Safe({'hackney_url', 'http'})),
+     ?_assert(Addr(<<"db">>)), ?_assert(Addr("db")),
+     ?_assert(Addr("db\351")),
+     ?_assertNot(Addr(<<"%2E">>)), ?_assertNot(Addr(<<"%2e%2E">>)),
+     ?_assert(Addr(<<"account%2Fab%2Fcd">>)),
+     ?_assertNot(Addr(<<>>)), ?_assertNot(Addr("")),
+     ?_assertNot(Addr(<<"/">>)), ?_assertNot(Addr("//")),
+     ?_assertNot(Addr(<<"db/x">>)), ?_assertNot(Addr(<<"db?x">>)),
+     ?_assertNot(Addr(<<"db#x">>)), ?_assertNot(Addr(<<"db\n">>)),
+     ?_assertNot(Addr(<<"db x">>)), ?_assertNot(Addr("d\tx")),
+     ?_assertNot(Addr(<<".">>)), ?_assertNot(Addr("..")),
+     ?_assert(Addr(<<"...">>)), ?_assert(Addr(<<".x">>)),
+     ?_assert(Addr(<<"x.">>)),
+     ?_assertNot(Addr('db')), ?_assertNot(Addr(42))].
+
+%% The transport-door helpers by shape (TEST exports): the header scan names
+%% a pair by its name and a non-pair whole, accepts hackney's parameterised
+%% value (pairs and bare keys) but never as a name, and the cookie option is
+%% judged by what `hackney_cookie:setcookie/3' writes or refuses; a method
+%% is letters, by code point.
+transport_door_helpers_by_shape_test_() ->
+    Cyrillic = list_to_atom([$G, 16#415, $T]),
+    [?_assertEqual('safe', couchbeam_httpc:unsafe_header([])),
+     ?_assertEqual('safe', couchbeam_httpc:unsafe_header(
+                             [{<<"X-A">>, {<<"v">>, [{<<"k">>, <<"1">>}]}},
+                              {'x', 1}, {"X-B", "y"}])),
+     ?_assertEqual('safe', couchbeam_httpc:unsafe_header(
+                             [{<<"X-A">>, {<<"v">>, [<<"k">>, "j",
+                                                     {<<"a">>, <<"b">>}]}}])),
+     ?_assertEqual({'unsafe', <<"X-A">>},
+                   couchbeam_httpc:unsafe_header(
+                     [{<<"X-A">>, {<<"v">>, [<<"k\n">>]}}])),
+     ?_assertEqual({'unsafe', <<"X-A">>},
+                   couchbeam_httpc:unsafe_header(
+                     [{<<"X-A">>, {<<"v">>, [{'a', 'b', 'c'}]}}])),
+     ?_assertEqual({'unsafe', {<<"X-A">>, []}},
+                   couchbeam_httpc:unsafe_header([{{<<"X-A">>, []}, <<"1">>}])),
+     ?_assertEqual({'unsafe', <<"X-A">>},
+                   couchbeam_httpc:unsafe_header(
+                     [{<<"X-A">>, {<<"v">>, [{<<"k">>, <<"1\r">>}]}}])),
+     ?_assertEqual({'unsafe', <<"X-A">>},
+                   couchbeam_httpc:unsafe_header([{<<"X-A">>, 1.5}])),
+     ?_assertEqual({'unsafe', 'bare'},
+                   couchbeam_httpc:unsafe_header(
+                     [{<<"X-A">>, <<"1">>}, 'bare'])),
+     ?_assertEqual({'unsafe', {'x', 'y', 'z'}},
+                   couchbeam_httpc:unsafe_header([{'x', 'y', 'z'}])),
+     ?_assertEqual('safe', couchbeam_httpc:unsafe_cookie([])),
+     ?_assertEqual('safe', couchbeam_httpc:unsafe_cookie(
+                             [{'cookie', [{<<"a">>, <<"1">>}, <<"b=2">>]}])),
+     ?_assertEqual('safe', couchbeam_httpc:unsafe_cookie(
+                             [{'cookie', {<<"a">>, <<"1=2">>,
+                                          [{'domain', <<"x">>},
+                                           {'path', "/p"},
+                                           {'secure', 'true'}]}}])),
+     ?_assertEqual('safe', couchbeam_httpc:unsafe_cookie(
+                             [{'cookie', <<"a=1; b=2 c">>}])),
+     ?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie([{'cookie', 'not_a_cookie'}])),
+     ?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie(
+                     [{'cookie', {<<"a">>, <<"1">>,
+                                  [{'domain', <<"x\r\nX: y">>}]}}])),
+     ?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie(
+                     [{'cookie', {<<"a">>, <<"1">>,
+                                  [{'path', <<"/\nX: y">>}]}}])),
+     ?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie(
+                     [{'cookie', {<<"a">>, <<"1 2">>}}])),
+     ?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie(
+                     [{'cookie', {<<"a=b">>, <<"1">>}}])),
+     ?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie([{'cookie', {'a', <<"1">>}}])),
+     ?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie([{'cookie', [[<<"a=1">>]]}])),
+     ?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie(
+                     [{'cookie', {<<"a">>, <<"1">>, 'x'}}])),
+     ?_assert(couchbeam_httpc:usable_method('get')),
+     ?_assert(couchbeam_httpc:usable_method(<<"COPY">>)),
+     ?_assert(couchbeam_httpc:usable_method("put")),
+     ?_assertNot(couchbeam_httpc:usable_method(<<"GET /x">>)),
+     ?_assertNot(couchbeam_httpc:usable_method(<<"GET\r\n">>)),
+     ?_assertNot(couchbeam_httpc:usable_method(<<"GET\n">>)),
+     ?_assertNot(couchbeam_httpc:usable_method("get\n")),
+     ?_assertNot(couchbeam_httpc:usable_method(Cyrillic)),
+     ?_assertNot(couchbeam_httpc:usable_method('')),
+     ?_assertNot(couchbeam_httpc:usable_method([$G | $E])),
+     ?_assertNot(couchbeam_httpc:usable_method(42)),
+     ?_assertNot(couchbeam_httpc:usable_method(<<>>))].
+
+%% The transport door is the one point every bounded caller passes (the
+%% consumer's maintenance module builds its `_find'/`_bulk_docs' URLs itself
+%% and calls `db_request_bounded/7'; `request_bounded/6,7' is exported too):
+%% a method, a URL or a header that would split or truncate the request line
+%% is refused there whatever built it. The URL is named by its path only —
+%% the consumer carries the CouchDB credentials in it — and the refusal
+%% happens before any connection.
+db_request_bounded_refuses_unsafe_request_lines_test_() ->
+    Cyrillic = list_to_atom([$G, 16#415, $T]),
+    Cases =
+        [{"URL that hackney cannot parse",
+          fun(Url) ->
+                  {'post', binary:replace(Url, <<"http://">>,
+                                            <<"http://u:p?x@">>), []}
+          end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_url', 'undefined'}},
+         {"URL with CR/LF in the path",
+          fun(Url) -> {'post', Url, []} end,
+          [<<"db\r\nX: y">>, <<"_find">>],
+          {'unsafe_url', <<"/db\r\nX: y/_find">>}},
+         {"URL with CR/LF past a question mark",
+          fun(Url) -> {'post', Url, []} end,
+          [<<"db?x\r\nX: y">>, <<"_find">>],
+          {'unsafe_url', <<"/db">>}},
+         {"URL with a hash: the fragment is never sent",
+          fun(Url) -> {'post', Url, []} end,
+          [<<"db#x">>, <<"_find">>],
+          {'unsafe_url', <<"/db">>}},
+         {"string URL with a line terminator",
+          fun(Url) -> {'post', binary_to_list(Url), []} end,
+          [<<"db?x\nX: y">>, <<"_find">>],
+          {'unsafe_url', <<"/db">>}},
+         {"method with a line terminator",
+          fun(Url) -> {<<"POST\r\nX: y">>, Url, []} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_method', <<"POST\r\nX: y">>}},
+         {"caller header value with a line terminator",
+          fun(Url) ->
+                  {'post', Url, [{<<"X-A">>, <<"1\r\nX-Injected: yes">>}]}
+          end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_header', <<"X-A">>}},
+         {"caller header name with a line terminator",
+          fun(Url) -> {'post', Url, [{<<"X-A\n">>, <<"1">>}]} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_header', <<"X-A\n">>}},
+         {"header named by the all-clear atom `safe', with a line terminator",
+          fun(Url) -> {'post', Url, [{'safe', <<"1\r\nX: y">>}]} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_header', 'safe'}},
+         {"header name in hackney's parameterised form",
+          fun(Url) -> {'post', Url, [{{<<"X-A">>, []}, <<"1">>}]} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_header', {<<"X-A">>, []}}},
+         {"method with a bare trailing LF",
+          fun(Url) -> {<<"GET\n">>, Url, []} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_method', <<"GET\n">>}},
+         {"atom method beyond Latin-1",
+          fun(Url) -> {Cyrillic, Url, []} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_method', Cyrillic}},
+         {"URL with a tab in the query",
+          fun(Url) -> {'post', <<Url/binary, "?a\tb">>, []} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_url', <<"/db/_find">>}},
+         {"method with a space",
+          fun(Url) -> {<<"GET /x HTTP/1.1">>, Url, []} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_method', <<"GET /x HTTP/1.1">>}},
+         {"integer method",
+          fun(Url) -> {42, Url, []} end,
+          [<<"db">>, <<"_find">>],
+          {'unsafe_method', 42}},
+         {"URL with a space in the path: refused by segment policy",
+          fun(Url) -> {'post', Url, []} end,
+          [<<"db x">>, <<"_find">>],
+          {'unsafe_url', <<"/db x/_find">>}}],
+    [{Label,
+      fun() ->
+              Verdict = refused_before_transport(
+                          fun(#db{server=Server, options=Opts}) ->
+                                  Url = hackney_url:make_url(
+                                          couchbeam_httpc:server_url(Server),
+                                          Parts, []),
+                                  {Method, ReqUrl, Headers} = Shape(Url),
+                                  {'ok', Budget} =
+                                      couchbeam_httpc:new_request_budget(
+                                        {1000, 1024}),
+                                  couchbeam_httpc:db_request_bounded(
+                                    Method, ReqUrl, Headers, <<"{}">>, Opts,
+                                    [200], Budget)
+                          end, []),
+              ?assertEqual({'error', Expected}, Verdict)
+      end}
+     || {Label, Shape, Parts, Expected} <- Cases].
+
+%% The netloc is not the request line: the consumer keeps its CouchDB
+%% credentials there raw, hackney turns them into a `basic_auth' option and
+%% an `Authorization' header, and a password with a space reaches the wire
+%% as base64 — no reason to refuse the request. The door judges
+%% `#hackney_url.raw_path', see `unsafe_request_line/2'.
+bounded_request_leaves_credentials_with_a_space_alone_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    drain_transport_messages(),
+    Body = <<"{\"db_name\":\"db\"}">>,
+    with_http_request_server(
+      fun(Socket, Request, Parent) ->
+              assert_request_line(<<"GET /db HTTP/1.1">>, Request),
+              assert_request_header(
+                <<"Authorization">>,
+                <<"Basic ", (base64:encode(<<"u:p w">>))/binary>>, Request),
+              send_json_response(Socket, Body),
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              <<"http://", HostPort/binary>> = BaseUrl,
+              Server = couchbeam:server_connection(
+                         <<"http://u:p w@", HostPort/binary>>,
+                         [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+              ?assertMatch({'ok', _, _},
+                           couchbeam:db_info_bounded(Db, {1000, 1024})),
+              assert_success_left_nothing_behind()
+      end).
+
+%% The `cookie' request option becomes a `Cookie' header inside hackney,
+%% after any header scan of the caller's list; every shape hackney accepts
+%% is judged here first.
+db_request_bounded_refuses_a_line_terminated_cookie_option_test_() ->
+    [{Label,
+      fun() ->
+              Verdict = refused_before_transport(
+                          fun(#db{server=Server, options=Opts}) ->
+                                  Url = hackney_url:make_url(
+                                          couchbeam_httpc:server_url(Server),
+                                          [<<"db">>, <<"_find">>], []),
+                                  {'ok', Budget} =
+                                      couchbeam_httpc:new_request_budget(
+                                        {1000, 1024}),
+                                  couchbeam_httpc:db_request_bounded(
+                                    'post', Url, [], <<"{}">>,
+                                    [{'cookie', Cookie} | Opts], [200], Budget)
+                          end, []),
+              ?assertEqual({'error', {'unsafe_header', <<"Cookie">>}}, Verdict)
+      end}
+     || {Label, Cookie} <- [{"binary", <<"a=1\r\nX: y">>},
+                            {"pair", {<<"a">>, <<"1\nX: y">>}},
+                            {"triple", {<<"a\r">>, <<"1">>, []}},
+                            {"triple with a path option",
+                             {<<"a">>, <<"1">>, [{'path', <<"/\r\nX: y">>}]}},
+                            {"triple with a domain option",
+                             {<<"a">>, <<"1">>, [{'domain', <<"x\nX: y">>}]}},
+                            {"pair whose value hackney refuses (a space)",
+                             {<<"a">>, <<"1 2">>}},
+                            {"pair whose name hackney refuses (a semicolon)",
+                             {<<"a;b">>, <<"1">>}},
+                            {"list of pairs",
+                             [{<<"a">>, <<"1">>},
+                              {<<"b">>, <<"2\r\nX: y">>}]}]].
+
+%% The header the module adds itself is as caller-controlled as the ones
+%% handed in: `X-Kazoo-Log-ID' is the process call id, which the consumer
+%% sets from the request it serves.
+db_request_bounded_refuses_a_line_terminated_call_id_header_test() ->
+    Previous = kz_log:get_callid(),
+    _ = kz_log:put_callid(<<"req\r\nX-Injected: yes">>),
+    try
+        Verdict = refused_before_transport(
+                    fun(#db{server=Server, options=Opts}) ->
+                            Url = hackney_url:make_url(
+                                    couchbeam_httpc:server_url(Server),
+                                    [<<"db">>, <<"_find">>], []),
+                            {'ok', Budget} =
+                                couchbeam_httpc:new_request_budget(
+                                  {1000, 1024}),
+                            couchbeam_httpc:db_request_bounded(
+                              'post', Url, [], <<"{}">>, Opts, [200], Budget)
+                    end, []),
+        ?assertEqual({'error', {'unsafe_header', <<"X-Kazoo-Log-ID">>}},
+                     Verdict)
+    after
+        _ = kz_log:put_callid(Previous)
+    end.
+
+%% A refusal raised inside the view stream — `couchbeam_view_stream' runs
+%% the transport door in the stream process, with the caller's call id
+%% adopted through the `kz_log_id' stream option — reaches the
+%% `fetch_bounded/4' caller as the door's own reason, with nothing left
+%% behind: no connection, no lifecycle message, no process of the bounded
+%% transport.
+bounded_fetch_refuses_a_line_terminated_call_id_inside_the_stream_test() ->
+    ensure_couchbeam_supervisor(),
+    Previous = kz_log:get_callid(),
+    _ = kz_log:put_callid(<<"req\r\nX-Injected: yes">>),
+    try
+        Verdict = refused_before_transport(
+                    fun(Db) ->
+                            couchbeam_view:fetch_bounded(
+                              Db, 'all_docs', [], {1000, 1024})
+                    end, []),
+        ?assertEqual({'error', {'unsafe_header', <<"X-Kazoo-Log-ID">>}},
+                     Verdict),
+        assert_no_lifecycle_messages(),
+        assert_no_bounded_processes_left()
+    after
+        _ = kz_log:put_callid(Previous)
+    end.
+
+%% The budget shape is judged before the request line on the transport door
+%% (`db_request_bounded/7' pattern-matches the map first).
+db_request_bounded_judges_the_budget_before_the_url_test() ->
+    Verdict = refused_before_transport(
+                fun(#db{server=Server, options=Opts}) ->
+                        Url = hackney_url:make_url(
+                                couchbeam_httpc:server_url(Server),
+                                [<<"db?x\r\nX: y">>, <<"_find">>], []),
+                        couchbeam_httpc:db_request_bounded(
+                          'post', Url, [], <<"{}">>, Opts, [200], 'bogus')
+                end, []),
+    ?assertEqual({'error', 'invalid_request_budget'}, Verdict).
+
 bounded_fetch_refuses_unencodable_key_value_test() ->
     ensure_couchbeam_supervisor(),
     Pid = self(),
@@ -5730,9 +6569,10 @@ with_captured_warnings_tolerates_leftover_handler_test() ->
 %% as a cleanup barrier, the transport error reported to `stream_to' before
 %% the manager forgets the ref, the manager closing the socket when the
 %% tracked owner dies — verified by hand against 1.25.0 (this repository's
-%% lock) and 1.20.1 (`kazoo_5027/make/deps.mk'). A move past either version
-%% must fail here and send its author back to those internals rather than
-%% trust the suite's silence.
+%% lock) and 1.20.1 (the version the consumer, kazoo_5027, pinned when this
+%% line was cut: a snapshot of 2026-09-05, not maintained here). A move past
+%% either version must fail here and send its author back to those
+%% internals rather than trust the suite's silence.
 hackney_version_is_verified_test() ->
     'ok' = case application:load('hackney') of
                'ok' -> 'ok';
@@ -6909,3 +7749,194 @@ discard_messages() ->
     receive
         _ -> discard_messages()
     end.
+
+%% Cookie options must be renderable before a worker or budget starts.
+bounded_cookie_option_shapes_test_() ->
+    Bad = [[{'secure', 'false'}], [{'http_only', 'false'}],
+           [{'secure', 1}], [{'http_only', <<"true">>}],
+           [{'max_age', -1}], [{'max_age', 1.5}], [{'max_age', <<"1">>}],
+           [{'domain', 'host'}], [{'path', 999}], [{'path', {'v', []}}],
+           [{'domain', 'x', 'y'}], [{'secure', 'true', 'extra'}],
+           [{'domain', <<"host">>} | 'improper'],
+           [{'path', <<"/">>} | 'improper']],
+    Good = [[{'secure', 'true'}, {'http_only', 'true'}],
+            [{'max_age', 0}], [{'max_age', 123}],
+            [{'domain', "host"}, {'path', <<"/p">>}]],
+    [?_assertEqual({'unsafe', <<"Cookie">>}, couchbeam_httpc:unsafe_cookie(
+                    [{'cookie', {<<"a">>, <<"1">>, Opts}}])) || Opts <- Bad]
+        ++ [?_assertEqual('safe', couchbeam_httpc:unsafe_cookie(
+                           [{'cookie', {<<"a">>, <<"1">>, Opts}}]))
+            || Opts <- Good].
+
+bounded_header_scalar_depth_test_() ->
+    [?_assertEqual({'unsafe', <<"X-A">>},
+                   couchbeam_httpc:unsafe_header([{<<"X-A">>, Value}]))
+     || Value <- [{{'v', []}, []}, {'v', [{'k', {'v', []}}]},
+                  {'v', [{{'k', []}, 'v'}]}]].
+
+bounded_header_name_boundaries_test_() ->
+    [?_assertEqual({'unsafe', Name},
+                   couchbeam_httpc:unsafe_header([{Name, <<"v">>}]))
+     || Name <- [<<>>, "", '', <<"X:A">>, <<"X A">>, "X\tA"]].
+
+bounded_raw_path_control_bytes_test_() ->
+    [?_test(assert_refused_before_transport(
+              {'error', {'unsafe_url', <<"/db", C, "/_find">>}},
+              fun(#db{server=Server, options=Opts}) ->
+                      Url = <<(couchbeam_httpc:server_url(Server))/binary,
+                              "/db", C, "/_find">>,
+                      {'ok', Budget} = couchbeam_httpc:new_request_budget(
+                                         {1000, 1024}),
+                      couchbeam_httpc:db_request_bounded(
+                        'get', Url, [], <<>>, Opts, [200], Budget)
+              end))
+     || C <- [0, 11, 12, 31, 127]].
+
+bounded_doc_id_segments_test_() ->
+    Ids = [<<".">>, <<"..">>, <<"x/../y">>, <<"x/./y">>, <<"_design/">>,
+           <<"%2e">>, <<"%2E%2E">>, <<"x/%2e%2e/y">>,
+           <<"_design%2F">>, ".", "..", "x/%2E/y"],
+    [?_test(assert_refused_before_transport(
+              {'error', 'missing_doc_id'},
+              fun(Db) -> couchbeam:open_doc_bounded(
+                           Db, Id, [], {1000, 1024}) end)) || Id <- Ids]
+        ++ [?_test(assert_refused_before_transport(
+                     {'error', 'missing_doc_id'},
+                     fun(Db) -> couchbeam:save_doc_bounded(
+                                  Db, {[{<<"_id">>, Id}]}, [],
+                                  {1000, 1024}) end)) || Id <- Ids].
+
+bounded_proxy_option_is_refused_test() ->
+    assert_refused_before_transport(
+      {'error', {'unsupported_option', 'proxy'}},
+      fun(#db{server=Server, options=Opts}) ->
+              Url = hackney_url:make_url(couchbeam_httpc:server_url(Server),
+                                        [<<"db">>], []),
+              {'ok', Budget} = couchbeam_httpc:new_request_budget({1000, 1024}),
+              couchbeam_httpc:db_request_bounded(
+                'get', Url, [], <<>>, [{'proxy', <<"http://proxy">>} | Opts],
+                [200], Budget)
+      end).
+
+legacy_db_info_encodes_path_space_as_plus_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    with_http_request_server(
+      fun(Socket, Request, Parent) ->
+              assert_request_line(<<"GET /db+x HTTP/1.1">>, Request),
+              send_json_response(Socket, <<"{}">>),
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl, [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db x">>),
+              ?assertMatch({'ok', _}, couchbeam:db_info(Db))
+      end).
+
+bounded_db_name_latin1_binary_wire_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    with_http_request_server(
+      fun(Socket, Request, Parent) ->
+              assert_request_line(<<"GET /db%E9 HTTP/1.1">>, Request),
+              send_json_response(Socket, <<"{}">>),
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              Server = couchbeam:server_connection(
+                         BaseUrl, [{'no_proxy_env', 'true'}]),
+              {'ok', Db} = couchbeam:open_db(Server, <<"db", 233>>),
+              ?assertMatch({'ok', _, _},
+                           couchbeam:db_info_bounded(Db, {1000, 1024}))
+      end).
+
+
+bounded_transport_extra_header_sources_test_() ->
+    [?_test(assert_refused_before_transport(
+       {'error', Expected},
+       fun(#db{server=Server, options=Opts}) ->
+           Url = <<(couchbeam_httpc:server_url(Server))/binary, "/db">>,
+           {'ok', Budget} = couchbeam_httpc:new_request_budget({1000, 1024}),
+           couchbeam_httpc:db_request_bounded(
+             'get', Url, Headers, Body, Extra ++ Opts, [200], Budget)
+       end))
+     || {Headers, Body, Extra, Expected} <-
+        [{[], <<>>, [{'path_encode_fun', fun(Path) -> Path end}],
+          {'unsupported_option', 'path_encode_fun'}},
+         {[], {'stream_multipart', 0, <<"bad\r\nboundary">>}, [],
+          {'unsafe_header', <<"Content-Type">>}},
+         {[{<<"X-A">>, <<"v">>} | 'improper'], <<>>, [],
+          {'unsafe_header', 'undefined'}}]].
+
+bounded_header_control_bytes_test_() ->
+    [?_assertEqual({'unsafe', <<"X-A">>},
+                   couchbeam_httpc:unsafe_header([{<<"X-A">>, <<C>>}]))
+     || C <- [0, 1, 11, 12, 31, 127]]
+        ++ [?_assertEqual({'unsafe', <<"X", C>>},
+                          couchbeam_httpc:unsafe_header(
+                            [{<<"X", C>>, <<"v">>}]))
+            || C <- [0, 1, 31, 127, $(, $), $/, $=, 233]]
+        ++ [?_assertEqual('safe', couchbeam_httpc:unsafe_header(
+                                    [{<<"X-A">>, <<"a\tb", 233>>}]))].
+
+bounded_address_control_bytes_test_() ->
+    [?_assertNot(couchbeam_httpc:addressable(<<"db", C>>))
+     || C <- [0, 1, 11, 12, 31, 127]].
+
+bounded_cookie_and_parameter_headers_wire_test_() ->
+    [?_test(begin
+        {'ok', _} = application:ensure_all_started('hackney'),
+        with_http_request_server(
+          fun(Socket, Request, Parent) ->
+              assert_request_header(<<"X-Params">>, <<"v;k=42;bare">>, Request),
+              lists:foreach(fun(Value) ->
+                  ?assertNotEqual('nomatch', binary:match(Request, Value))
+              end, Expected),
+              send_json_response(Socket, <<"{}">>),
+              Parent ! {'server_done', self()}
+          end,
+          fun(BaseUrl) ->
+              {'ok', Budget} = couchbeam_httpc:new_request_budget({1000, 1024}),
+              {'ok', 200, _, Ref} = couchbeam_httpc:db_request_bounded(
+                'get', <<BaseUrl/binary, "/db">>,
+                [{<<"X-Params">>, {'v', [{'k', 42}, 'bare']}}], <<>>,
+                [{'cookie', Cookie}, {'no_proxy_env', 'true'}], [200], Budget),
+              ?assertMatch({'ok', _, _},
+                           couchbeam_httpc:bounded_json_body(Ref, Budget)),
+              assert_success_left_nothing_behind()
+          end)
+    end)
+     || {Cookie, Expected} <-
+        [{{<<"a">>, <<"1">>}, [<<"a=1; Version=1">>]},
+         {{<<"a">>, <<"1">>, [{'domain', "host"}, {'path', <<"/p">>},
+                                {'secure', 'true'}, {'http_only', 'true'}]},
+          [<<"a=1; Version=1; Domain=host; Path=/p; Secure; HttpOnly">>]},
+         {[<<"raw=2">>, {<<"a">>, <<"1">>},
+            {<<"b">>, <<"3">>, [{'path', "/"}]}],
+          [<<"raw=2">>, <<"a=1; Version=1">>, <<"b=3; Version=1; Path=/">>]}]].
+
+bounded_direct_request_url_refusal_test_() ->
+    [?_test(assert_refused_before_transport(
+      {'error', {'unsafe_url', <<"/db">>}},
+      fun(#db{server=Server, options=Opts}) ->
+          Url = <<(couchbeam_httpc:server_url(Server))/binary, "/db?q=x y">>,
+          {'ok', Budget} = couchbeam_httpc:new_request_budget({1000, 1024}),
+          case Arity of
+              6 -> couchbeam_httpc:request_bounded(
+                     'get', Url, [], <<>>, Opts, Budget);
+              7 -> couchbeam_httpc:request_bounded(
+                     'get', Url, [], <<>>, Opts, Budget, self())
+          end
+      end)) || Arity <- [6, 7]].
+
+
+bounded_atom_header_controls_test() ->
+    Name = <<"X-A">>,
+    Value = list_to_atom([$a, 1]),
+    ?assertEqual({'unsafe', Name},
+                 couchbeam_httpc:unsafe_header([{Name, Value}])).
+
+bounded_cookie_control_values_test_() ->
+    [?_assertEqual({'unsafe', <<"Cookie">>},
+                   couchbeam_httpc:unsafe_cookie([{'cookie', Cookie}]))
+     || Cookie <- [<<"a=", 0>>, {<<"a">>, <<"1">>, [{'domain', <<"h", 0>>}]},
+                   {<<"a">>, <<"1">>, [{'path', <<"/", 127>>}]}]].

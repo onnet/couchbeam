@@ -108,27 +108,41 @@ fetch_async(Db, ViewName, Options) ->
 %% is the only consumer. See `couchbeam_httpc:new_request_budget/1' for the
 %% worst-case latency.
 %%
+%% A database name that is not one path segment is refused with
+%% `{'error', {'unsafe_db_name', Name}}', a view name whose half is not one
+%% with `{'error', {'invalid_view_name', ViewName}}' — before any budget,
+%% see `couchbeam_httpc:addressable/1'.
+%%
 %% Unlike the three document doors, this one needs the `couchbeam' application
 %% running: the view stream is a child of `couchbeam_view_sup', and
 %% `make_view/4' reaches `supervisor:start_child/2', which exits `noproc' when
 %% the supervisor is not there. That is a precondition of the door -- the same
 %% one legacy `stream/3' has -- and not one of the typed refusals below.
+%% Input validation precedes the budget. unsafe_header, unsafe_url and
+%% unsafe_method can also arrive from the transport door inside the stream,
+%% after budget creation. A non-#db{} argument raises function_clause.
 -spec fetch_bounded(db(), 'all_docs' | {binary(), binary()}, list(),
                     couchbeam_httpc:request_budget_spec()) ->
           {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
-fetch_bounded(Db, ViewName, Options, BudgetSpec) ->
-    case usable_view_name(ViewName) of
-        'true' -> fetch_bounded_options(Db, ViewName, Options, BudgetSpec);
-        'false' -> {'error', {'invalid_view_name', ViewName}}
+fetch_bounded(#db{name=DbName}=Db, ViewName, Options, BudgetSpec) ->
+    %% Refusals in address order: the database, then the view, then the
+    %% options — each one before any budget or connection.
+    case {couchbeam_httpc:addressable(DbName), usable_view_name(ViewName)} of
+        {'false', _} ->
+            {'error', {'unsafe_db_name', DbName}};
+        {'true', 'false'} ->
+            {'error', {'invalid_view_name', ViewName}};
+        {'true', 'true'} ->
+            fetch_bounded_options(Db, ViewName, Options, BudgetSpec)
     end.
 
 %% A view name the bounded door can address before any budget: `all_docs',
-%% or `{DesignName, ViewName}' with both halves a binary or a Latin-1 string
-%% — what `hackney_url:make_url/3' renders as path segments. A float or a
-%% tuple half would crash `hackney_url' after the budget clock started; an
-%% atom other than `all_docs' is refused by `make_view/4' only after the
-%% budget was created and the stream started; a string with code points
-%% above 255 crashes `hackney_bstr:to_binary/1'.
+%% or `{DesignName, ViewName}' with both halves one path segment
+%% (`couchbeam_httpc:addressable/1') — `hackney_url:make_url/3' places them
+%% into the request line raw. A float, a tuple or an atom half would crash
+%% `hackney_url:fix_path/1' when building the view, before budget creation.
+%% An atom other than `all_docs' is refused by `make_view/4'. The bounded
+%% door validates those inputs before invoking it.
 -spec usable_view_name(term()) -> boolean().
 usable_view_name('all_docs') ->
     'true';
@@ -138,9 +152,8 @@ usable_view_name(_ViewName) ->
     'false'.
 
 -spec usable_view_name_part(term()) -> boolean().
-usable_view_name_part(Part) when is_binary(Part) -> 'true';
-usable_view_name_part(Part) when is_list(Part) -> io_lib:latin1_char_list(Part);
-usable_view_name_part(_Part) -> 'false'.
+usable_view_name_part(Part) ->
+    couchbeam_httpc:addressable(Part).
 
 %% `length/1' in the guard refuses an improper list too: the exception it
 %% raises makes the guard false, and `parse_view_options/1' has a clause
@@ -150,7 +163,7 @@ usable_view_name_part(_Part) -> 'false'.
           {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
 fetch_bounded_options(Db, ViewName, Options, BudgetSpec)
   when is_list(Options), length(Options) >= 0 ->
-    case bounded_view_query_args(Options) of
+    case bounded_view_query_args(ViewName, Options) of
         {'ok', #view_query_args{}} ->
             fetch_bounded_parsed(Db, ViewName, Options, BudgetSpec);
         {'error', Entry} ->
@@ -166,7 +179,12 @@ fetch_bounded_options(_Db, _ViewName, Options, _BudgetSpec) ->
 %% (`{key, self()}' — `couchbeam_ejson:encode/1' raises inside the parser, in
 %% the calling process), a parsed pair `hackney_url:qs/1' cannot render
 %% (`{limit, 1.5}' — `make_view/4' would crash while building the URL, after
-%% the budget clock started), and a POST body the encoder refuses (`{keys,
+%% the budget clock started) or one carrying a CR/LF in either half
+%% (`couchbeam_httpc:request_line_safe/1'), a `list' function name that is
+%% not one path segment on a `{Design, View}' name (`{list, 42}' or
+%% `{list, l}' — `hackney_url:fix_path/1' would crash on it after the budget
+%% clock started; on `all_docs' the pair travels as a query half only), and
+%% a POST body the encoder refuses (`{keys,
 %% [self()]}' — the one piece the parser stores unencoded, which would
 %% otherwise fail only inside the encoder worker of a stream already spawned
 %% under a running budget; see `encodable_view_keys/1'). The renderability
@@ -182,13 +200,17 @@ fetch_bounded_options(_Db, _ViewName, Options, _BudgetSpec) ->
 %% catch-all drops it (parity with legacy `fetch/3'), so a typo in an option
 %% name is silently ignored. Whether the bounded door should narrow that is
 %% an owner decision recorded with the port's deferred work.
--spec bounded_view_query_args(list()) ->
+-spec bounded_view_query_args('all_docs' | {term(), term()}, list()) ->
           {'ok', view_query_args()} | {'error', term()}.
-bounded_view_query_args(Options) ->
+bounded_view_query_args(ViewName, Options) ->
     try parse_view_options(Options) of
         #view_query_args{options=Parsed}=Args ->
             case couchbeam_httpc:invalid_query_param(Parsed) of
-                'undefined' -> encodable_view_keys(Args);
+                'undefined' ->
+                    case unusable_list_name(ViewName, Options) of
+                        'undefined' -> encodable_view_keys(Args);
+                        Entry -> {'error', Entry}
+                    end;
                 {'invalid_param', Entry} -> {'error', Entry}
             end;
         {'error', Reason} ->
@@ -200,6 +222,41 @@ bounded_view_query_args(Options) ->
                 Entry -> {'error', Entry}
             end
     end.
+
+%% `{list, Name}' is the one option `make_view/4' places into the path — on
+%% a `{Design, View}' name only (`/_design/D/_list/Name/V'); on `all_docs'
+%% the pair travels as a query half and the renderability scan is its whole
+%% contract. `hackney_url:fix_path/1' accepts a binary or a string; the
+%% renderability scan sees the same pair as a query half and would let an
+%% integer or an atom through. Walked by hand, as `make_view/4' reads it
+%% through `proplists:get_value/2': a bare `list' atom is `true' to it (and
+%% `fix_path(true)' would crash after the budget), a `list'-keyed tuple of
+%% another size makes proplists:get_value stop at that first tuple and
+%% return its default. Both are refused by name here.
+-spec unusable_list_name('all_docs' | {term(), term()}, list()) ->
+          'undefined' | term().
+unusable_list_name('all_docs', _Options) ->
+    'undefined';
+unusable_list_name({_Design, _View}, Options) ->
+    unusable_list_entry(Options).
+
+-spec unusable_list_entry(list()) -> 'undefined' | term().
+unusable_list_entry([]) ->
+    'undefined';
+unusable_list_entry(['list' | _Rest]) ->
+    'list';
+unusable_list_entry([{'list', Name}=Entry | Rest]) ->
+    case couchbeam_httpc:addressable(Name) of
+        'true' -> unusable_list_entry(Rest);
+        'false' -> Entry
+    end;
+unusable_list_entry([Entry | Rest]) when is_tuple(Entry) ->
+    case tuple_size(Entry) > 0 andalso element(1, Entry) =:= 'list' of
+        'true' -> Entry;
+        'false' -> unusable_list_entry(Rest)
+    end;
+unusable_list_entry([_Entry | Rest]) ->
+    unusable_list_entry(Rest).
 
 %% The parser raised: name the entry whose value `couchbeam_ejson:encode/1'
 %% refuses (the parser encodes `key', `startkey'/`start_key' and

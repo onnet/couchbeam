@@ -409,13 +409,26 @@ db_info(#db{server=Server, name=DbName, options=Opts}) ->
 
 %% @doc `db_info/1' with a typed request budget `{TimeoutMs, MaxBytes}'.
 %% Returns the database info together with the cumulative raw response bytes,
-%% only after the transport cleanup has been proven. Error atoms follow
+%% only after the transport cleanup has been proven. A database name that is
+%% not one path segment is refused with `{'error', {'unsafe_db_name', Name}}'
+%% before any budget (see `couchbeam_httpc:addressable/1'). Error atoms follow
 %% `db_info/1' (`db_not_found'); `{'error', 'timeout'}' means the absolute
 %% deadline passed before the result was delivered. See
 %% `couchbeam_httpc:new_request_budget/1' for the deadline semantics.
+%% Transport validation can return unsafe_header, unsafe_url or unsafe_method.
+%% A non-#db{} first argument raises function_clause.
 -spec db_info_bounded(db(), couchbeam_httpc:request_budget_spec()) ->
           {'ok', ejson_object(), non_neg_integer()} | {'error', term()}.
-db_info_bounded(#db{server=Server, name=DbName, options=Opts}, BudgetSpec) ->
+db_info_bounded(#db{name=DbName}=Db, BudgetSpec) ->
+    case couchbeam_httpc:addressable(DbName) of
+        'true' -> db_info_bounded_addressed(Db, BudgetSpec);
+        'false' -> {'error', {'unsafe_db_name', DbName}}
+    end.
+
+-spec db_info_bounded_addressed(db(), couchbeam_httpc:request_budget_spec()) ->
+          {'ok', ejson_object(), non_neg_integer()} | {'error', term()}.
+db_info_bounded_addressed(#db{server=Server, name=DbName, options=Opts},
+                          BudgetSpec) ->
     case couchbeam_httpc:new_request_budget(BudgetSpec) of
         {'ok', Budget} ->
             Url = hackney_url:make_url(
@@ -500,23 +513,35 @@ open_doc(#db{server=Server, options=Opts}=Db, DocId, Params) ->
 %% `{'error', {'unsupported_param', 'accept'}}', `open_revs' (CouchDB answers
 %% it with an array of revisions) with `{'error', {'unsupported_param',
 %% 'open_revs'}}', and `attachments=true' yields inline base64 attachments,
-%% never a multipart stream. `DocId' must be a non-empty binary or Latin-1
-%% string: an empty one would address the database itself, anything else
-%% would crash inside `encode_docid/1', so both are refused with
-%% `{'error', 'missing_doc_id'}'. `Params' must be a list of `{Key, Value}'
-%% pairs — the only shape `hackney_url:make_url/3' accepts — or the offending
+%% never a multipart stream. The database name must be one path segment
+%% (`couchbeam_httpc:addressable/1'), or the call is refused with
+%% `{'error', {'unsafe_db_name', Name}}'. `DocId' must be a non-empty binary
+%% or Latin-1 string without CR/LF: an empty one would address the database
+%% itself, a float, a tuple or a string beyond Latin-1 would crash inside
+%% `encode_docid/1', and a line terminator is kept off the request line by
+%% the door rather than by the urlencoding `encode_docid/1' applies — all of
+%% them are refused with `{'error', 'missing_doc_id'}'. `Params' must be a
+%% list of `{Key, Value}' pairs — the only shape `hackney_url:make_url/3'
+%% accepts — that
+%% `hackney_url:qs/1' can render and that carry no CR/LF, or the offending
 %% entry is refused with `{'error', {'invalid_param', Entry}}'. Every refusal
 %% happens before any connection. Returns the document with the cumulative
 %% raw response bytes after the transport cleanup proof.
+%% Transport validation can return unsafe_header, unsafe_url or unsafe_method.
+%% A non-#db{} first argument raises function_clause.
 -spec open_doc_bounded(db(), docid(), list(),
                        couchbeam_httpc:request_budget_spec()) ->
           {'ok', doc(), non_neg_integer()} | {'error', term()}.
-open_doc_bounded(#db{server=Server, options=Opts}=Db,
+open_doc_bounded(#db{server=Server, name=DbName, options=Opts}=Db,
                  DocId, Params, BudgetSpec) ->
-    case usable_doc_id(DocId) of
-        'false' ->
+    %% Refusals in address order: the database, then the document, then
+    %% the query — each one before any budget or connection.
+    case {couchbeam_httpc:addressable(DbName), usable_doc_id(DocId)} of
+        {'false', _} ->
+            {'error', {'unsafe_db_name', DbName}};
+        {'true', 'false'} ->
             {'error', 'missing_doc_id'};
-        'true' ->
+        {'true', 'true'} ->
             open_doc_bounded_params(Server, Opts, Db, DocId, Params, BudgetSpec)
     end.
 
@@ -544,11 +569,25 @@ open_doc_bounded_params(Server, Opts, Db, DocId, Params, BudgetSpec) ->
 %% were the document. `null' (a JSON null `_id'), a string with code points
 %% above 255 and other terms would crash inside `encode_docid/1' after the
 %% caller already committed to the call.
+%% A line terminator in the id is refused for the same reason a query half
+%% carrying one is: `encode_docid/1' urlencodes it today, and the door does
+%% not rest on that (`couchbeam_httpc:request_line_safe/1'). Dot segments
+%% after percent-decoding and an empty `_design/' suffix are refused too.
 -spec usable_doc_id(term()) -> boolean().
-usable_doc_id(DocId) when is_binary(DocId) -> DocId =/= <<>>;
-usable_doc_id(DocId) when is_list(DocId) ->
-    DocId =/= [] andalso io_lib:latin1_char_list(DocId);
+usable_doc_id(DocId) when is_binary(DocId); is_list(DocId) ->
+    DocId =/= <<>> andalso DocId =/= []
+        andalso couchbeam_httpc:request_line_safe(DocId)
+        andalso usable_doc_segments(iolist_to_binary(DocId));
 usable_doc_id(_DocId) -> 'false'.
+
+-spec usable_doc_segments(binary()) -> boolean().
+usable_doc_segments(DocId) ->
+    Decoded = hackney_url:urldecode(DocId, 'skip'),
+    Decoded =/= <<"_design/">>
+        andalso lists:all(fun(Segment) ->
+                                  Segment =/= <<".">>
+                                      andalso Segment =/= <<"..">>
+                          end, binary:split(Decoded, <<"/">>, ['global'])).
 
 %% Query parameters and write options are refused by the shape and
 %% renderability scan `couchbeam_httpc:invalid_query_param/1' shares with the
@@ -660,13 +699,19 @@ save_doc(Db, Doc, Options) ->
     save_doc(Db, Doc, [], Options).
 
 %% @doc `save_doc/3' with a typed request budget `{TimeoutMs, MaxBytes}'.
-%% Unlike `save_doc/3' the document must already carry a usable `_id' — a
-%% non-empty binary: minting a UUID would be a second, unbudgeted round trip,
-%% and the id goes both into the URL and into the JSON body, where an Erlang
-%% string would encode as an array of integers — so an absent, `null', empty
-%% or non-binary `_id' is refused with `{'error', 'missing_doc_id'}' before
-%% any connection is made. `Options' must be a list of `{Key, Value}' pairs,
-%% or the offending entry is refused with `{'error', {'invalid_param', Entry}}'.
+%% The database name must be one path segment (`couchbeam_httpc:addressable/1'),
+%% or the call is refused with `{'error', {'unsafe_db_name', Name}}' before
+%% anything else is looked at. Unlike `save_doc/3' the document must already
+%% carry a usable `_id' — a non-empty binary: minting a UUID would be a
+%% second, unbudgeted round trip, and the id goes both into the URL and into
+%% the JSON body, where an Erlang string would encode as an array of
+%% integers — so an absent, `null', empty or non-binary `_id' is refused with
+%% `{'error', 'missing_doc_id'}' before any connection is made, and so is one
+%% carrying a line terminator, which the door keeps off the request line
+%% itself (see `usable_doc_id/1'). `Options' must be a list of
+%% `{Key, Value}' pairs that `hackney_url:qs/1' can render and that carry no
+%% CR/LF, or the
+%% offending entry is refused with `{'error', {'invalid_param', Entry}}'.
 %% The document body travels exactly as `save_doc/3' sends it — one JSON
 %% encoding, `_attachments' included, whether they are stubs or inline base64
 %% `data' (legacy picks multipart only for the explicit `Atts' argument of
@@ -691,20 +736,38 @@ save_doc(Db, Doc, Options) ->
 %% caught inside the encoder worker, while `{'error', {'json_encoding_failed',
 %% Reason}}' is that worker dying from the outside. Both are reported before
 %% anything reaches the wire.
+%% Transport validation can return unsafe_header, unsafe_url or unsafe_method.
+%% A non-#db{} first argument raises function_clause.
 -spec save_doc_bounded(db(), doc(), list(),
                        couchbeam_httpc:request_budget_spec()) ->
           {'ok', doc(), non_neg_integer()} | {'error', term()}.
-save_doc_bounded(#db{server=Server, options=Opts}=Db,
-                 {Props}=Doc, Options, BudgetSpec)
+save_doc_bounded(#db{name=DbName}=Db, Doc, Options, BudgetSpec) ->
+    %% Like every bounded door, a first argument that is not a `#db{}' is a
+    %% `function_clause' -- the type is the contract, not a refusal.
+    case couchbeam_httpc:addressable(DbName) of
+        'true' -> save_doc_bounded_addressed(Db, Doc, Options, BudgetSpec);
+        'false' -> {'error', {'unsafe_db_name', DbName}}
+    end.
+
+-spec save_doc_bounded_addressed(db(), term(), term(),
+                                 couchbeam_httpc:request_budget_spec()) ->
+          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+save_doc_bounded_addressed(#db{server=Server, options=Opts}=Db,
+                           {Props}=Doc, Options, BudgetSpec)
   when is_list(Props), length(Props) >= 0 ->
     case couchbeam_util:get_value(<<"_id">>, Props) of
-        DocId when is_binary(DocId), DocId =/= <<>> ->
-            save_doc_bounded_guarded(
-              Server, Opts, Db, Doc, DocId, Options, BudgetSpec);
+        DocId when is_binary(DocId) ->
+            case usable_doc_id(DocId) of
+                'true' ->
+                    save_doc_bounded_guarded(
+                      Server, Opts, Db, Doc, DocId, Options, BudgetSpec);
+                'false' ->
+                    {'error', 'missing_doc_id'}
+            end;
         _NoUsableId ->
             {'error', 'missing_doc_id'}
     end;
-save_doc_bounded(_Db, _Doc, _Options, _BudgetSpec) ->
+save_doc_bounded_addressed(_Db, _Doc, _Options, _BudgetSpec) ->
     %% A document is `{Proplist}' with a proper list inside; a map, a bare
     %% list (what a bulk save takes), an improper property list (on which
     %% `couchbeam_util:get_value/2' would crash in `lists:keyfind/3') or
