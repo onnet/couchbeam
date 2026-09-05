@@ -118,31 +118,40 @@ fetch_async(Db, ViewName, Options) ->
 %% `make_view/4' reaches `supervisor:start_child/2', which exits `noproc' when
 %% the supervisor is not there. That is a precondition of the door -- the same
 %% one legacy `stream/3' has -- and not one of the typed refusals below.
-%% Input validation precedes the budget. unsafe_header, unsafe_url and
-%% unsafe_method can also arrive from the transport door inside the stream,
-%% after budget creation. A non-#db{} argument raises function_clause.
+%% Input refusals precede the budget; `{'error', {'unsafe_header', Name}}',
+%% `{'error', {'unsafe_url', Path}}' and `{'error', {'unsafe_method', M}}'
+%% can also arrive from the transport door inside the stream, after the
+%% budget was created. A first argument that is not a `#db{}' raises
+%% `function_clause'.
 -spec fetch_bounded(db(), 'all_docs' | {binary(), binary()}, list(),
                     couchbeam_httpc:request_budget_spec()) ->
           {'ok', [ejson_object()], non_neg_integer()} | {'error', term()}.
 fetch_bounded(#db{name=DbName}=Db, ViewName, Options, BudgetSpec) ->
     %% Refusals in address order: the database, then the view, then the
-    %% options — each one before any budget or connection.
-    case {couchbeam_httpc:addressable(DbName), usable_view_name(ViewName)} of
-        {'false', _} ->
+    %% options — each one before any budget or connection. Sequenced, not
+    %% paired in a tuple: the view is not judged once the database is
+    %% refused.
+    case couchbeam_httpc:addressable(DbName) of
+        'false' ->
             {'error', {'unsafe_db_name', DbName}};
-        {'true', 'false'} ->
-            {'error', {'invalid_view_name', ViewName}};
-        {'true', 'true'} ->
-            fetch_bounded_options(Db, ViewName, Options, BudgetSpec)
+        'true' ->
+            case usable_view_name(ViewName) of
+                'false' ->
+                    {'error', {'invalid_view_name', ViewName}};
+                'true' ->
+                    fetch_bounded_options(Db, ViewName, Options, BudgetSpec)
+            end
     end.
 
 %% A view name the bounded door can address before any budget: `all_docs',
 %% or `{DesignName, ViewName}' with both halves one path segment
 %% (`couchbeam_httpc:addressable/1') — `hackney_url:make_url/3' places them
 %% into the request line raw. A float, a tuple or an atom half would crash
-%% `hackney_url:fix_path/1' when building the view, before budget creation.
-%% An atom other than `all_docs' is refused by `make_view/4'. The bounded
-%% door validates those inputs before invoking it.
+%% `hackney_url:fix_path/1' when building the view, after the budget clock
+%% started (`fetch_bounded_parsed/4' creates the budget, then
+%% `stream_with_budget/4' builds the view). An atom other than `all_docs' is
+%% refused by `make_view/4'. The bounded door judges those inputs before
+%% any of that.
 -spec usable_view_name(term()) -> boolean().
 usable_view_name('all_docs') ->
     'true';

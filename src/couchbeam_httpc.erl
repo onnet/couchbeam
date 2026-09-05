@@ -15,6 +15,7 @@
          invalid_query_param/1,
          request_line_safe/1,
          addressable/1,
+         segments_usable/1,
          cancel_request/1,
          request_identity/2,
          db_resp/2,
@@ -24,7 +25,8 @@
 
 -ifdef(TEST).
 -export([decode_bounded_json/3, request_options/2,
-         unsafe_header/1, unsafe_cookie/1, usable_method/1]).
+         unsafe_header/1, unsafe_cookie/1, unsafe_body_header/1,
+         unsafe_basic_auth/1, usable_method/1]).
 -endif.
 %% urls utils
 -export([server_url/1, db_url/1, doc_url/2]).
@@ -92,6 +94,11 @@ db_request(Method, Url, Headers, Body, Options, Expect) ->
 %% guardian, the transport lease and this call's process-dictionary entry
 %% alive until the calling process dies -- the budget bounds the reply, not
 %% the caller's silence. The doors of `couchbeam' do this for their callers.
+%% The path segments of `Url' are the caller's: the door judges the request
+%% line as hackney writes it (`request_line_safe/1', `unsafe_request_line/2'),
+%% where a `?' already is the query — so every segment a caller places into
+%% the URL, the database name first, must pass `addressable/1' before the
+%% URL is built; `POST /db?x/_find' reaches `/db' otherwise.
 -spec db_request_bounded(term(), term(), list(), term(), list(), [integer()],
                          request_budget()) ->
           {'ok', integer(), list(), reference()} | {'error', term()}.
@@ -190,9 +197,8 @@ new_request_budget(_) ->
 %%
 %% A line terminator (CR or LF) in either half of a pair is refused as well,
 %% see `request_line_safe/1'. For query pairs this refusal duplicates what
-%% `hackney_url:qs/1' does today (it percent-encodes both halves; `qs/1',
-%% `urlencode/2' and `pathencode/1' are byte-identical in hackney 1.20.1 and
-%% 1.25.0); it stands because whether a door can split a request must be a
+%% `hackney_url:qs/1' does today (it percent-encodes both halves); it
+%% stands because whether a door can split a request must be a
 %% contract of the door, not a property of the dependency's encoder —
 %% GHSA-j9wq-vxxc-94wf / CVE-2026-47075 (`hackney_url:make_url/3' passing a
 %% raw query string through unencoded) is the class.
@@ -228,6 +234,12 @@ renderable_query_term(_Term) ->
 
 %% @doc A term the doors may write into the request line: a binary or a
 %% Latin-1 string carrying neither CR nor LF — and only those two shapes.
+%% A byte above 127 in a name reaches the path percent-encoded as that
+%% byte, whether the name is a binary or a Latin-1 string
+%% (`hackney_url:make_url/3' turns a string into bytes with
+%% `list_to_binary/1', then `pathencode/1' writes `%E9'); a direct
+%% caller's string URL goes through `hackney_url:parse_url/1', which
+%% encodes it as UTF-8 first (`%C3%A9').
 %% An iolist, a `#hackney_url{}' or a string beyond Latin-1, all of which
 %% hackney itself accepts, are refused here by design. This is the contract
 %% behind every address half a bounded call sends — the database name, the
@@ -244,14 +256,12 @@ renderable_query_term(_Term) ->
 %%
 %% Why the door checks and not the encoder: `hackney_url:make_url/3' joins
 %% path parts raw; `hackney_url:parse_url/1' then cuts the URL at the first
-%% `#' (the fragment is never sent) and at the first `?' (the rest is the
+%% `#' (the fragment is never sent — on the direct connections the door
+%% requires, see `unsafe_request_line/2') and at the first `?' (the rest is the
 %% query, sent as it is), and only the path half is percent-encoded
 %% (`hackney_url:pathencode/1', replaceable by the `path_encode_fun'
-%% request option) before the request line is written. The parser is
-%% spelled `parse_path'/`parse_fragment' in 1.20.1 and `cut_query'/
-%% `cut_fragment' in 1.25.0; for the URL shapes the doors build the two
-%% behave the same, and where they differ — a `?' inside the netloc, which
-%% is where the consumer keeps its credentials — no door writes. So a
+%% request option) before the request line is written (`cut_query/1' and
+%% `cut_fragment/1' on the pinned 1.25.0). So a
 %% database, design or view name carrying `?' followed by a line terminator
 %% splits the request on the pinned hackney as it is; a document id survives
 %% only because `couchbeam_util:encode_docid/1' urlencodes it, a query half
@@ -277,13 +287,17 @@ request_line_safe(_Term) ->
 %% attachment of document `x' (Kazoo names its databases `account%2F…',
 %% percent-encoded, and that form passes); and an empty name — or one
 %% `fix_path/1' strips to empty, `/' — collapses the path (`PUT /doc'
-%% creates a database). A space or a tab is what the transport door refuses
-%% in the request line: judged here, the name is refused before any budget
-%% and not there, after one (on the view door, after the stream started).
-%% `.' and `..' pass `pathencode/1' as they are, and an intermediary that
-%% normalises dot segments re-addresses `PUT /../doc' to `/doc' — the same
-%% class as `/'. This is the contract of the database name, the design and
-%% view names and a `list' function name; a document id is urlencoded by
+%% creates a database). A space, a tab, any other C0 control and DEL are
+%% what the transport door refuses in the request line (a tab is refused
+%% with the controls, below 32): judged here, the name is refused before
+%% any budget and not there, after one (on the view door, after the stream
+%% started). `.' and `..' pass `pathencode/1' as they are, and an
+%% intermediary that normalises dot segments re-addresses `PUT /../doc' to
+%% `/doc' — the same class as `/'; judged after percent-decoding, on every
+%% `/'-separated segment of the decoded name (`segments_usable/1'), so
+%% `%2E%2E', `..%2Fx' and `%2F' are refused with `..'. This is the contract
+%% of the database name, the design and view names and a `list' function
+%% name; a document id is urlencoded by
 %% `couchbeam_util:encode_docid/1' and keeps the wider `request_line_safe/1'
 %% contract.
 -spec addressable(term()) -> boolean().
@@ -296,12 +310,35 @@ addressable(_Term) ->
 
 -spec addressable_bytes(binary()) -> boolean().
 addressable_bytes(Bin) ->
-    Decoded = hackney_url:urldecode(Bin, 'skip'),
-    Decoded =/= <<".">> andalso Decoded =/= <<"..">>
+    segments_usable(hackney_url:urldecode(Bin, 'skip'))
         andalso lists:all(fun(C) -> C >= 32 andalso C =/= 127 end,
                           binary_to_list(Bin))
         andalso 'nomatch' =:= binary:match(Bin, [<<"?">>, <<"#">>, <<"/">>,
-                                                <<" ">>, <<"\t">>]).
+                                                <<" ">>]).
+
+%% @private Exported for `couchbeam', not for consumers.
+%% @doc Every `/'-separated segment of a percent-decoded path half is a
+%% name: not empty, not `.', not `..'. Why the decoded form: RFC 3986
+%% lets a normaliser decode the unreserved characters (`%2E' is `.',
+%% section 6.2.2.2) and then remove the dot segments (section 6.2.2.3), so
+%% `%2E%2E' can become `..' on the way; `/' is reserved and a conforming
+%% normaliser keeps `%2F', but CouchDB itself reads `%2F' in a name as `/'
+%% (Kazoo's `account%2Fab' is the database `account/ab' on the server), so
+%% a segment behind it is judged as the server sees it — `..%2Fx' is `../x'
+%% and `%2F' is two empty names. `%3F', `%23' and `%0D%0A' decode to
+%% reserved or control characters no normaliser touches and are data. The
+%% decode is single, as one normalisation pass is: `%252E%252E' decodes to
+%% `%2E%2E' and passes, and only a second decoding hop would see `..'
+%% there — a hop that would equally re-address any other percent-encoding
+%% and is not modelled here. The document id, split the same way in
+%% `couchbeam:usable_doc_id/1', shares the predicate (its policy: an owner
+%% decision recorded with the port).
+-spec segments_usable(binary()) -> boolean().
+segments_usable(Decoded) ->
+    lists:all(fun(Segment) ->
+                      Segment =/= <<>> andalso Segment =/= <<".">>
+                          andalso Segment =/= <<"..">>
+              end, binary:split(Decoded, <<"/">>, ['global'])).
 
 %% `io_lib:latin1_char_list/1' answers `false' on anything but a flat list of
 %% Latin-1 characters, so the membership scans only ever run on one.
@@ -417,16 +454,55 @@ run_bounded_worker(WorkFun, ResultFun, Budget, TimeoutMs) ->
             {'error', 'timeout'}
     end.
 
-%% A caller-supplied multipart boundary is interpolated into Content-Type
-%% by hackney after its request headers have been prepared.
+%% A streamed multipart body names two headers hackney writes after its
+%% request headers have been prepared
+%% (`hackney_request:handle_multipart_body/5'): the caller's boundary is
+%% interpolated into `Content-Type', and the size is stored as
+%% `Content-Length' as it is — `chunked' selects `Transfer-Encoding:
+%% chunked' instead, an integer is the length, anything else reaches the
+%% wire through `hackney_bstr:to_binary/1' unchecked. Judged in the order
+%% hackney stores them: the boundary, then the size. The bare
+%% `stream_multipart' atom names neither (hackney mints the boundary and
+%% streams chunked).
 -spec unsafe_body_header(term()) -> 'safe' | {'unsafe', binary()}.
-unsafe_body_header({'stream_multipart', _Size, Boundary}) ->
-    case is_binary(Boundary) andalso header_value_bytes(Boundary) of
-        'true' -> 'safe';
+unsafe_body_header({'stream_multipart', Size}) ->
+    unsafe_multipart_size(Size);
+unsafe_body_header({'stream_multipart', Size, Boundary}) ->
+    case multipart_boundary(Boundary) of
+        'true' -> unsafe_multipart_size(Size);
         'false' -> {'unsafe', <<"Content-Type">>}
     end;
 unsafe_body_header(_Body) ->
     'safe'.
+
+%% hackney writes `multipart/form-data; boundary=' and the boundary raw —
+%% unquoted — so the boundary must be both an RFC 2046 boundary (section
+%% 5.1.1: 1 to 70 characters, not ending in a space) and an HTTP token: of
+%% the `bchars' set, `()/:=?,' and space are `tspecials' a receiver stops
+%% the token at, so a boundary carrying one is read short and the parts
+%% never match it, and a `;' or a `"' would start another parameter of
+%% `Content-Type' outright. What is left is DIGIT / ALPHA / `'+_-.'.
+-spec multipart_boundary(term()) -> boolean().
+multipart_boundary(Boundary) when is_binary(Boundary) ->
+    Size = byte_size(Boundary),
+    Size >= 1 andalso Size =< 70
+        andalso lists:all(fun boundary_char/1, binary_to_list(Boundary));
+multipart_boundary(_Boundary) ->
+    'false'.
+
+-spec boundary_char(byte()) -> boolean().
+boundary_char(C) ->
+    (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z)
+        orelse (C >= $0 andalso C =< $9)
+        orelse lists:member(C, "'+_-.").
+
+-spec unsafe_multipart_size(term()) -> 'safe' | {'unsafe', binary()}.
+unsafe_multipart_size('chunked') ->
+    'safe';
+unsafe_multipart_size(Size) when is_integer(Size), Size >= 0 ->
+    'safe';
+unsafe_multipart_size(_Size) ->
+    {'unsafe', <<"Content-Length">>}.
 
 %% @private Exported for `couchbeam_view_stream', not for consumers.
 %% @doc Bind an ephemeral worker's lifetime to `Parent'. A worker that is
@@ -634,7 +710,15 @@ request_bounded(Method, Url, Headers, Body, Options, Budget) ->
 %% `{'bounded_transport_cleanup_started', Caller, CleanupBudget}' and
 %% `{'bounded_transport_cleanup', Caller, Ref | 'undefined'}' and must consume
 %% it (see `couchbeam_view:fetch_bounded/4'); its death closes the transport
-%% even while the caller is blocked.
+%% even while the caller is blocked. The path segments of `Url' are the
+%% caller's: a `?' in one is the query by the time this door sees it, so a
+%% direct caller judges each segment with `addressable/1' before building
+%% the URL (see `db_request_bounded/7'). `Options' is a proper list by
+%% type; one that is not raises in the calling process, before any worker
+%% or connection. Refusals here come in the order of the request line, the
+%% options and the headers; the shape of `Budget' is the type's contract
+%% (`db_request_bounded/7' judges it first, this door inside
+%% `prepare_request/5').
 -spec request_bounded(term(), term(), list(), term(), list(), request_budget(),
                       pid()) ->
           {'ok', reference()} | {'error', term()}.
@@ -646,11 +730,15 @@ request_bounded(Method, Url, Headers, Body, Options, Budget,
                 'true' ->
                     {'error', {'unsupported_option', 'follow_redirect'}};
                 'false' ->
-                    case lists:keymember('proxy', 1, Options) of
+                    %% Read as hackney reads its options
+                    %% (`proplists:get_value/2'): a bare atom is the option
+                    %% set to `true', and `path_encode_fun = true' has no
+                    %% clause in `hackney_url:normalize/2'.
+                    case proplists:is_defined('proxy', Options) of
                         'true' -> {'error', {'unsupported_option', 'proxy'}};
                         'false' ->
-                            case lists:keymember('path_encode_fun',
-                                                 1, Options) of
+                            case proplists:is_defined('path_encode_fun',
+                                                      Options) of
                                 'true' ->
                                     {'error', {'unsupported_option',
                                                'path_encode_fun'}};
@@ -667,11 +755,13 @@ request_bounded(Method, Url, Headers, Body, Options, Budget,
 
 %% The last point before hackney, and the only one every bounded caller
 %% passes — the doors, `db_request_bounded/7' and a direct caller alike. A
-%% method or a URL that would split (CR/LF anywhere in it: base64 hides one
-%% in the credentials, nothing else does), truncate (`#': hackney cuts the
-%% URL at the first one wherever it sits and never sends the fragment) or
-%% malform (C0/DEL in the target, or SP/HT in the raw query) the request
-%% line is refused here. SP/HT in the path are also refused by policy:
+%% method or a URL that would split (CR/LF anywhere in it: the netloc is
+%% written as the `Host' header raw, `hackney_request:maybe_add_host/2';
+%% only the credentials, which base64 hides, would survive one), truncate
+%% (`#': hackney cuts the URL at the first one wherever it sits and never
+%% sends the fragment) or malform (C0/DEL in the target, SP/HT or a byte
+%% above 127 in the raw query, an empty path) the request line is refused
+%% here. SP/HT in the path are also refused by policy:
 %% pathencode writes them as `+' / `%09', not as raw whitespace.
 %% Judged on what hackney writes after the method —
 %% `#hackney_url.raw_path', the path with the raw query and fragment — and
@@ -701,13 +791,66 @@ unsafe_request_line(Method, Url) ->
             end
     end.
 
+%% Every `%' in the netloc opens a valid escape, and the decoded netloc —
+%% what `normalize/2' hands to `maybe_add_host/2' for a DNS host — is
+%% printable ASCII without a space. `urldecode/2' in `skip' mode is the
+%% same walk `urldecode/1' does in `crash' mode, so a netloc whose escapes
+%% are valid decodes identically in both.
+-spec netloc_usable(binary()) -> boolean().
+netloc_usable(Netloc) ->
+    Decoded = hackney_url:urldecode(Netloc, 'skip'),
+    percent_escapes_valid(Netloc)
+        andalso lists:all(fun(C) -> C > 32 andalso C < 127 end,
+                          binary_to_list(Decoded)).
+
+-spec percent_escapes_valid(binary()) -> boolean().
+percent_escapes_valid(<<$%, H, L, Rest/binary>>) ->
+    hex_digit(H) andalso hex_digit(L) andalso percent_escapes_valid(Rest);
+percent_escapes_valid(<<$%, _Rest/binary>>) ->
+    'false';
+percent_escapes_valid(<<_C, Rest/binary>>) ->
+    percent_escapes_valid(Rest);
+percent_escapes_valid(<<>>) ->
+    'true'.
+
+-spec hex_digit(byte()) -> boolean().
+hex_digit(C) ->
+    (C >= $0 andalso C =< $9) orelse (C >= $a andalso C =< $f)
+        orelse (C >= $A andalso C =< $F).
+
 -spec raw_path_usable(binary() | string()) -> boolean().
 raw_path_usable(Url) ->
     try hackney_url:parse_url(Url) of
-        #hackney_url{raw_path=RawPath} when is_binary(RawPath) ->
-            'nomatch' =:= binary:match(RawPath, [<<"#">>, <<" ">>])
+        #hackney_url{path=Path, raw_path=RawPath, qs=Qs, netloc=Netloc}
+          when is_binary(Path), is_binary(RawPath), is_binary(Qs),
+               is_binary(Netloc) ->
+            %% An empty path with a query is a request target without a
+            %% leading slash (`GET ?x=y HTTP/1.1', `hackney:make_request/6'
+            %% joins path and query as they are) — and what a `?' inside
+            %% the authority leaves behind: `cut_query/1' cuts the whole
+            %% URL at the first `?', so `http://u:5984?x@host/db' parses as
+            %% host `u', port 5984, no path, and would leave for a host the
+            %% caller never named. An empty path WITHOUT a query is the
+            %% legal `http://host:5984', which `hackney_request:perform/2'
+            %% writes as `GET / HTTP/1.1'; it passes. The raw query is
+            %% written unencoded, so a byte above 127 in it is a malformed
+            %% target as well; the path half is percent-encoded by
+            %% `pathencode/1' and keeps Latin-1.
+            %% The netloc becomes the `Host' header, but not always as
+            %% written: `hackney_url:normalize/2' keeps it byte for byte
+            %% only when the host is an IP literal, and for a DNS name it
+            %% percent-decodes the host in CRASH mode
+            %% (`hackney_url:urldecode/1'), IDN-converts it and rebuilds
+            %% the netloc. So a `%' that is not a valid escape kills the
+            %% worker after the budget, and `ho%20st' would put a raw space
+            %% into the `Host' header — the netloc is judged as hackney
+            %% will write it, decoded, and its escapes are judged valid.
+            (Path =/= <<>> orelse Qs =:= <<>>)
+                andalso netloc_usable(Netloc)
+                andalso 'nomatch' =:= binary:match(RawPath, [<<"#">>, <<" ">>])
                 andalso lists:all(fun(C) -> C >= 32 andalso C =/= 127 end,
-                                  binary_to_list(RawPath));
+                                  binary_to_list(RawPath))
+                andalso lists:all(fun(C) -> C < 128 end, binary_to_list(Qs));
         #hackney_url{} ->
             'false'
     catch
@@ -720,16 +863,24 @@ raw_path_usable(Url) ->
 %% raises on a code point above 255 where a refusal is due; a `$'-anchored
 %% regex lets a bare trailing LF through). A space or a tab in it re-parses
 %% the request target on a lenient server (`GET /x HTTP/1.1 /db …'), an
-%% integer is a nonsense token, and CR/LF splits the line.
+%% integer is a nonsense token, and CR/LF splits the line. `connect' is
+%% refused by name although it is letters: `hackney:make_request/6' has a
+%% clause of its own for it that writes `CONNECT host:port' and drops the
+%% path, a tunnel flow the bounded reader was never written for.
 -spec usable_method(term()) -> boolean().
-usable_method(Method) when is_atom(Method) ->
-    letters_only(atom_to_list(Method));
-usable_method(Method) when is_binary(Method) ->
-    letters_only(binary_to_list(Method));
-usable_method(Method) when is_list(Method) ->
-    letters_only(Method);
+usable_method(Method)
+  when is_atom(Method); is_binary(Method); is_list(Method) ->
+    Chars = method_chars(Method),
+    letters_only(Chars)
+        andalso "connect" =/= string:lowercase(Chars);
 usable_method(_Method) ->
     'false'.
+
+%% Only reached for the three shapes `hackney_bstr:to_binary/1' renders.
+-spec method_chars(atom() | binary() | list()) -> list().
+method_chars(Method) when is_atom(Method) -> atom_to_list(Method);
+method_chars(Method) when is_binary(Method) -> binary_to_list(Method);
+method_chars(Method) -> Method.
 
 %% A non-empty, proper list of ASCII letters.
 -spec letters_only(term()) -> boolean().
@@ -762,17 +913,55 @@ letters_only_from(_Other) ->
 %% parameterised form: `to_iolist/1' lowercases it with
 %% `hackney_bstr:to_lower/1', which has no clause for a tuple.
 -spec unsafe_header(list()) -> 'safe' | {'unsafe', term()}.
-unsafe_header([]) ->
+unsafe_header(Headers) ->
+    case unsafe_header_entries(Headers) of
+        'safe' -> unsafe_framing(filter_undefined_headers(Headers));
+        Unsafe -> Unsafe
+    end.
+
+-spec unsafe_header_entries(term()) -> 'safe' | {'unsafe', term()}.
+unsafe_header_entries([]) ->
     'safe';
-unsafe_header([{Name, Value} | Rest]) ->
-    case header_name_safe(Name) andalso header_half_safe(Value) of
-        'true' -> unsafe_header(Rest);
+unsafe_header_entries([{_Name, 'undefined'} | Rest]) ->
+    unsafe_header_entries(Rest);
+unsafe_header_entries([{Name, Value} | Rest]) ->
+    case header_name_safe(Name) andalso header_value_safe(Name, Value) of
+        'true' -> unsafe_header_entries(Rest);
         'false' -> {'unsafe', Name}
     end;
-unsafe_header([Entry | _Rest]) ->
+unsafe_header_entries([Entry | _Rest]) ->
     {'unsafe', Entry};
-unsafe_header(_Tail) ->
+unsafe_header_entries(_Tail) ->
     {'unsafe', 'undefined'}.
+
+%% Hackney preserves caller framing on streamed and empty bodies.
+%% Equal lengths are unambiguous; conflicting lengths or TE plus CL are not.
+%% Omitted values have already been removed, just as preparation removes them.
+-spec unsafe_framing(list()) -> 'safe' | {'unsafe', binary()}.
+unsafe_framing(Headers) ->
+    Lengths = [canonical_length(V) || {K, V} <- Headers,
+                  hackney_bstr:to_lower(K) =:= <<"content-length">>],
+    Transfers = [hackney_bstr:to_lower(V) || {K, V} <- Headers,
+                    hackney_bstr:to_lower(K) =:= <<"transfer-encoding">>],
+    case lists:usort(Lengths) of
+        [] -> unsafe_transfer_encoding(Transfers);
+        [_] when Transfers =:= [] -> 'safe';
+        _ -> {'unsafe', <<"Content-Length">>}
+    end.
+
+%% Hackney selects chunk framing only for exactly `chunked', and does not
+%% apply any other transfer coding. Repeated fields would declare it twice.
+-spec unsafe_transfer_encoding([binary()]) -> 'safe' | {'unsafe', binary()}.
+unsafe_transfer_encoding([]) -> 'safe';
+unsafe_transfer_encoding([<<"chunked">>]) -> 'safe';
+unsafe_transfer_encoding(_Transfers) -> {'unsafe', <<"Transfer-Encoding">>}.
+
+-spec canonical_length(non_neg_integer() | binary()) -> binary().
+canonical_length(Value) when is_integer(Value) ->
+    integer_to_binary(Value);
+canonical_length(<<$0, Rest/binary>>) when Rest =/= <<>> ->
+    canonical_length(Rest);
+canonical_length(Value) -> Value.
 
 -spec header_name_safe(term()) -> boolean().
 header_name_safe(Name) ->
@@ -801,8 +990,8 @@ header_value_bytes(Bin) ->
 %% killable worker, after the budget started — a name carrying `=', `,',
 %% `;', a space, a tab, CR, LF, VT or FF and a value carrying any of those
 %% but `=', takes each setcookie half as iodata (an atom raises there),
-%% and writes the
-%% `domain' and `path' options raw after `; Domain=' and `; Path='. A list
+%% and writes the `domain' and `path' options raw after `; Domain=' and
+%% `; Path='. A list
 %% holds those shapes, each written as its own header. Every shape is judged
 %% here, before any budget, by what hackney would write or refuse.
 -spec unsafe_cookie(list()) -> 'safe' | {'unsafe', binary()}.
@@ -835,9 +1024,15 @@ cookie_list_safe([Cookie | Rest]) when is_binary(Cookie); is_tuple(Cookie) ->
 cookie_list_safe(_Other) ->
     'false'.
 
+%% The name is judged non-empty for the reason a header name is
+%% (`header_name_safe/1'): `hackney_cookie:setcookie/3' accepts an empty one
+%% and writes `Cookie: =1; Version=1', a pair with no name. An empty cookie
+%% VALUE, and an empty `cookie' binary, are well-formed and stay accepted —
+%% they write an empty header value, as any other header may.
 -spec cookie_pair_safe(term(), term(), term()) -> boolean().
 cookie_pair_safe(Name, Value, Opts) ->
     cookie_half_safe(Name, [<<"=">> | ?COOKIE_VALUE_REFUSED])
+        andalso iolist_size(Name) > 0
         andalso cookie_half_safe(Value, ?COOKIE_VALUE_REFUSED)
         andalso cookie_opts_safe(Opts).
 
@@ -871,9 +1066,56 @@ cookie_opt_safe(Key, Value) when Key =:= 'secure'; Key =:= 'http_only' ->
 cookie_opt_safe('max_age', Value) ->
     is_integer(Value) andalso Value >= 0;
 cookie_opt_safe(Key, Value) when Key =:= 'domain'; Key =:= 'path' ->
-    (is_binary(Value) orelse is_list(Value)) andalso header_scalar_safe(Value);
+    %% Written raw after `; Domain=' / `; Path=': a `;' or `,' inside would
+    %% end the attribute and start another cookie pair on the same header.
+    cookie_half_safe(Value, [<<";">>, <<",">>]);
 cookie_opt_safe(_Key, _Value) ->
     'true'.
+
+%% hackney reads four request headers back before it writes them, and each
+%% reader takes a different shape — so the rule is per name, not one rule
+%% for the four. Common to all of them: hackney reads the value with
+%% `hackney_headers_new:get_value/2', which returns the parameterised
+%% `{Value, Params}' form whole, and every reader then hands it to
+%% `hackney_bstr:to_binary/1', which has no tuple clause — that form is
+%% refused on these four names and stays legal on every other.
+%% Beyond that: `expect' and `transfer-encoding' go through
+%% `hackney_bstr:to_lower/1' (`hackney_request:expectation/1',
+%% `req_type/2'), which renders an atom or a Latin-1 string through
+%% `to_binary/1' as well, so any scalar is safe there; `content-type' is
+%% parsed by `hackney_headers_new:parse_content_type/1' under a streamed
+%% multipart body, and that parser matches binaries only; `content-length'
+%% is stored back as the framing of the request, so it must be what a
+%% Content-Length may say — a nonnegative integer or a binary of digits.
+%% Nothing here rests on hackney overwriting a caller's Content-Length: it
+%% does for a plain body (`handle_body/4' recomputes it), and does not for
+%% a streamed or function body, which is the case this refusal is for.
+-spec header_value_safe(term(), term()) -> boolean().
+header_value_safe(Name, {_Value, _Params}=Half) ->
+    not hackney_reads_back(Name) andalso header_half_safe(Half);
+header_value_safe(Name, Half) ->
+    case hackney_bstr:to_lower(hackney_bstr:to_binary(Name)) of
+        <<"content-type">> -> is_binary(Half) andalso header_value_bytes(Half);
+        <<"content-length">> -> content_length_value(Half);
+        _Other -> header_half_safe(Half)
+    end.
+
+%% Judged after `header_name_safe/1', so the name renders as a binary.
+-spec hackney_reads_back(term()) -> boolean().
+hackney_reads_back(Name) ->
+    lists:member(hackney_bstr:to_lower(hackney_bstr:to_binary(Name)),
+                 [<<"expect">>, <<"transfer-encoding">>, <<"content-type">>,
+                  <<"content-length">>]).
+
+-spec content_length_value(term()) -> boolean().
+content_length_value(Value) when is_integer(Value) ->
+    Value >= 0;
+content_length_value(Value) when is_binary(Value) ->
+    Value =/= <<>>
+        andalso lists:all(fun(C) -> C >= $0 andalso C =< $9 end,
+                          binary_to_list(Value));
+content_length_value(_Value) ->
+    'false'.
 
 -spec header_half_safe(term()) -> boolean().
 header_half_safe({Value, Params}) when is_list(Params) ->
@@ -918,6 +1160,19 @@ follow_redirect_requested(Options) ->
           {'ok', reference()} | {'error', term()}.
 request_bounded_checked(Method, Url, Headers, Body, Options, Budget,
                         LifecycleOwner) ->
+    %% The caller's list is scanned twice, and this pass is the one that
+    %% has to be first: `prepare_request/5' walks the list in THIS process
+    %% before it prepends anything — `make_header_accept/1' reads it with
+    %% `couchbeam_util:get_value/2' (`lists:keyfind/3', then
+    %% `lists:member/2') and `filter_undefined_headers/1' folds it with
+    %% `lists:filter/2' — so an improper tail or a non-pair entry would
+    %% raise here, uncaught, instead of being refused. The second pass,
+    %% `unsafe_wire_header/4', judges what hackney will write: this list,
+    %% the headers `prepare_request/5' added, and the `Cookie',
+    %% `Authorization' and multipart `Content-Type'/`Content-Length'
+    %% headers hackney makes from the options and the body. A refusal names
+    %% the first offending entry the pass that sees it walks, so a caller's
+    %% bad header is named before a generated one.
     case unsafe_header(Headers) of
         {'unsafe', Name} -> {'error', {'unsafe_header', Name}};
         'safe' -> request_bounded_headers_checked(
@@ -938,12 +1193,17 @@ request_bounded_headers_checked(Method, Url, Headers, Body, Options, Budget,
                           proplists:delete(
                             'stream_to', strip_test_options(Options)))],
     case prepare_request(Method, Url, Headers, RequestOptions, Budget) of
-        {'ok', FinalHeaders, FinalOptions} ->
+        {'ok', FinalHeaders0, FinalOptions0} ->
+            FinalHeaders = filter_undefined_headers(FinalHeaders0),
+            %% Pin the effective app default to the value validated here.
+            AuthOptions = pin_insecure_auth_flag(FinalOptions0),
             %% Checked after `prepare_request/5': the Kazoo headers it adds
             %% are as caller-controlled as the ones handed in, and so is the
             %% `Cookie' header hackney will add from the options.
-            case unsafe_wire_header(FinalHeaders, FinalOptions, Body) of
+            case unsafe_wire_header(FinalHeaders, AuthOptions, Body, Url) of
                 'safe' ->
+                    FinalOptions = request_framing_options(
+                                     FinalHeaders, AuthOptions),
                     RequestFun = fun() ->
                                          request_prepared(
                                            Method, Url, FinalHeaders, Body,
@@ -959,18 +1219,93 @@ request_bounded_headers_checked(Method, Url, Headers, Body, Options, Budget,
             Error
     end.
 
-%% The headers in the order hackney writes them: the caller's and the ones
-%% `prepare_request/5' added, then the `Cookie' header it makes from the
-%% `cookie' option (`hackney_request:maybe_add_cookies/2').
--spec unsafe_wire_header(list(), list(), term()) -> 'safe' | {'unsafe', term()}.
-unsafe_wire_header(Headers, Options, Body) ->
+%% Header bytes must use the raw send path even when the body is chunked.
+%% Hackney's perform_all path sends the combined head/body through send_chunk.
+-spec request_framing_options(list(), list()) -> list().
+request_framing_options(Headers, Options) ->
+    case lists:any(fun({Name, _}) ->
+                      hackney_bstr:to_lower(Name) =:= <<"transfer-encoding">>
+                   end, Headers) of
+        'true' -> [{'perform_all', 'false'}
+                   | proplists:delete('perform_all', Options)];
+        'false' -> Options
+    end.
+
+%% Everything hackney will put on the wire that this module can still
+%% refuse: the caller's headers with the ones `prepare_request/5' added,
+%% then the headers hackney itself makes — `Cookie' from the `cookie'
+%% option and `Authorization' from `basic_auth'
+%% (`hackney_request:perform/2', `maybe_add_cookies/2'), then the
+%% `Content-Type' and `Content-Length' a streamed multipart body dictates
+%% (`handle_multipart_body/5'). The order here is the order of the
+%% refusals, not hackney's write order: `perform/2' merges its defaults and
+%% `hackney_headers_new:to_iolist/1' writes by insertion index.
+-spec unsafe_wire_header(list(), list(), term(), term()) ->
+          'safe' | {'unsafe', term()}.
+unsafe_wire_header(Headers, Options, Body, Url) ->
     case unsafe_header(Headers) of
         'safe' ->
             case unsafe_cookie(Options) of
-                'safe' -> unsafe_body_header(Body);
+                'safe' ->
+                    case unsafe_effective_auth(Url, Options) of
+                        'safe' -> unsafe_body_header(Body);
+                        UnsafeAuth -> UnsafeAuth
+                    end;
                 UnsafeCookie -> UnsafeCookie
             end;
         {'unsafe', _Name}=Unsafe -> Unsafe
+    end.
+
+%% The `basic_auth' request option becomes the `Authorization' header
+%% inside hackney (`hackney_request:perform/2'), each half through
+%% `hackney_bstr:to_binary/1' — a float, a tuple or a string beyond Latin-1
+%% would crash the worker after the budget. base64 hides every byte, a line
+%% terminator included, so a CR/LF here could not split the request; it is
+%% refused all the same, because `renderable_query_term/1' is the one rule
+%% every caller-supplied half of this module is judged by and a credential
+%% carrying one is a caller defect wherever it came from. In the same
+%% branch hackney reads `insecure_basic_auth', whose `case' has clauses for
+%% `true' and `false' only — any other value is a `case_clause' in the
+%% worker, after the budget — so it is judged here, where it is read.
+%% URL credentials also activate the flag, via `unsafe_effective_auth/2'.
+-spec unsafe_basic_auth(list()) -> 'safe' | {'unsafe', binary()}.
+unsafe_basic_auth(Options) ->
+    case proplists:get_value('basic_auth', Options) of
+        'undefined' -> 'safe';
+        {User, Password} ->
+            case renderable_query_term(User)
+                andalso renderable_query_term(Password)
+                andalso insecure_flag_usable(Options) of
+                'true' -> 'safe';
+                'false' -> {'unsafe', <<"Authorization">>}
+            end;
+        _Other -> {'unsafe', <<"Authorization">>}
+    end.
+
+-spec insecure_flag_usable(list()) -> boolean().
+insecure_flag_usable(Options) ->
+    is_boolean(effective_insecure_auth_flag(Options)).
+
+-spec effective_insecure_auth_flag(list()) -> term().
+effective_insecure_auth_flag(Options) ->
+    proplists:get_value('insecure_basic_auth', Options,
+                       hackney_app:get_app_env('insecure_basic_auth', 'true')).
+
+-spec pin_insecure_auth_flag(list()) -> list().
+pin_insecure_auth_flag(Options) ->
+    [{'insecure_basic_auth', effective_insecure_auth_flag(Options)}
+     | proplists:delete('insecure_basic_auth', Options)].
+
+-spec unsafe_effective_auth(term(), list()) -> 'safe' | {'unsafe', binary()}.
+unsafe_effective_auth(Url, Options) ->
+    case unsafe_basic_auth(Options) of
+        'safe' ->
+            #hackney_url{user=User} = hackney_url:parse_url(Url),
+            case User =:= <<>> orelse insecure_flag_usable(Options) of
+                'true' -> 'safe';
+                'false' -> {'unsafe', <<"Authorization">>}
+            end;
+        Unsafe -> Unsafe
     end.
 
 %% @private Exported for `couchbeam_view_stream', not for consumers.
@@ -1602,9 +1937,9 @@ adopt_bounded_request_now(Token, WorkerPid, MonitorRef, LeasePid, GuardianPid,
             %% owner exit closes the transport). Re-point that tracked owner
             %% at the lease before the temporary upload worker exits,
             %% otherwise the worker's exit would tear the request down.
-            %% Verified against 1.25.0, which this repository pins, and
-            %% against 1.20.1, which `kazoo_5027/make/deps.mk' pins: both
-            %% link the new owner in `handle_call({controlling_process,…})'.
+            %% Verified against 1.25.0, which this repository pins: it
+            %% links the new owner in
+            %% `handle_call({controlling_process,…})'.
             OwnershipResult = try
                                   gen_server:call(
                                     'hackney_manager',

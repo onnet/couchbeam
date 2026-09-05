@@ -4,34 +4,105 @@ couchbeam NEWS
 unreleased (bounded-otp27 line)
 -------------------------------
 
-- bounded doors refuse a database, design, view or `list' function name
-  that is not one request-path segment (CR/LF, `?', `#', `/', a space, a
-  tab, empty, `.' or `..'): `{error, {unsafe_db_name, Name}}',
-  `{error, {invalid_view_name, ViewName}}', `{error, {invalid_param, Entry}}'
-- the transport door behind every bounded request (`request_bounded/6,7',
-  `db_request_bounded/7') refuses a method that is not letters
-  (`{error, {unsafe_method, Method}}'), a URL whose request line would
-  split, truncate or malform (`{error, {unsafe_url, Path}}') and a header —
-  the `cookie' option included — carrying a line terminator or a shape
-  hackney cannot write (`{error, {unsafe_header, Name}}')
-- `request_line_safe/1' checks only shape and CR/LF; `addressable/1'
-  additionally checks path segments, including percent-encoded dot segments.
-  Both are exported for direct transport callers.
-- document ids with CR/LF, dot segments (also percent-encoded), or an empty
-  `_design/' suffix return `{error, missing_doc_id}'; query halves with
-  CR/LF return `{error, {invalid_param, Entry}}'
-- header names must be nonempty and contain no colon, space or tab;
-  parameterised values allow only scalar values and parameter halves.
-  Cookie options require `secure'/`http_only' = true, nonnegative integer
-  `max_age', and binary/iodata `domain'/`path' without CR/LF.
-- C0/DEL in the raw URL path is refused. SP/HT in the path is refused by
-  policy even though legacy pathencode writes `+' / `%09'. Explicit proxy
-  options return `{error, {unsupported_option, proxy}}'; callers must disable
-  environment proxies (`no_proxy_env') when their environment configures one.
+Names (the database, a design or view name, a `list' function name)
+
+- each must be one request-path segment, or the door refuses it before any
+  budget: `{error, {unsafe_db_name, Name}}',
+  `{error, {invalid_view_name, ViewName}}', `{error, {invalid_param, Entry}}'.
+  Refused: CR/LF, `?', `#', `/', a space, a tab, any other C0 control, DEL,
+  an empty name, and an empty, `.' or `..' segment of the percent-decoded
+  name (so `%2E%2E', `..%2Fx' and `%2F' too — CouchDB reads `%2F' in a name
+  as `/', which is why `account%2Fab' is one name and two segments)
+- document ids keep the wider contract — `?' and `#' in one are urlencoded
+  and address the document — but are refused for CR/LF and for an empty or
+  dot segment of the decoded id (an id ending in `_design/' among them),
+  with `{error, missing_doc_id}'; query halves carrying CR/LF are refused
+  with `{error, {invalid_param, Entry}}'
+
+The request line at the transport door (`request_bounded/6,7',
+`db_request_bounded/7')
+
+- the method must be letters and not `connect' (`{error, {unsafe_method,
+  Method}}') — door policy, narrower than the HTTP token grammar, because
+  CouchDB needs no other and `connect' is hackney's tunnel flow
+- the URL is refused with `{error, {unsafe_url, Path}}' when it carries
+  CR/LF, when its raw path carries `#', a space, a C0 control or DEL, when
+  its raw query carries a byte above 127 (the query is written unencoded),
+  when it has a query and no path (`http://host?x=y', and
+  `http://u:5984?x@host/db', whose authority a `?' cuts short), or when its
+  netloc — the `Host' header, percent-decoded and IDN-converted by
+  `hackney_url:normalize/2' for a DNS name — carries an invalid escape, a
+  space, a control or a byte above 127. `http://host:5984' with no path is
+  legal and passes. A URL `hackney_url:parse_url/1' cannot parse at all
+  answers `{error, {unsafe_url, undefined}}'
+- credentials in the netloc must be percent-encoded. Raw `?' or `#' in a
+  password cuts the URL there; a raw `@' or a `/' after a numeric prefix
+  re-parses the authority into a host the caller never named, and no door
+  can tell — `http://u:12/x@host:5984/db' is host `u', port 12 to hackney
+  and to this door alike. Where the URL becomes unparseable, the server
+  record is never made: `server_connection/2', and `server_connection/4'
+  through it, parse the URL. Where it stays parseable but wrong — a numeric
+  port half, `http://u:12?34@host:5984' — the record is made and every
+  bounded door then answers `{error, {unsafe_url, <<>>}}' while the legacy
+  doors keep sending the request
+- `request_line_safe/1' (shape and CR/LF) and `addressable/1' (one path
+  segment) are exported for direct transport callers, which must judge
+  every segment they place into a URL themselves — by the time the door
+  sees it a `?' is the query, so `POST /db?x/_find' reaches `/db'.
+  `segments_usable/1' is exported for `couchbeam' itself
+
+Headers, and the options and body hackney turns into headers
+
+- a header name must be a nonempty HTTP token; a value must carry no C0
+  control other than HT and no DEL, while Latin-1 bytes above 127 stay
+  accepted. A header list with a malformed tail answers
+  `{error, {unsafe_header, undefined}}' before header preparation
+- the four names hackney reads back before writing take narrower values:
+  none of them may carry the parameterised `{Value, Params}' form
+  (`hackney_bstr:to_binary/1' has no tuple clause); `content-type' must be
+  a binary (`parse_content_type/1' matches binaries only under a streamed
+  multipart body); `content-length' must be a nonnegative integer or a
+  binary of digits, since hackney keeps a caller's value as the framing of
+  a streamed or function body; `expect' and `transfer-encoding' take any
+  scalar. Conflicting Content-Length values and Transfer-Encoding together
+  with Content-Length are refused; numerically equal lengths remain legal.
+  Transfer-Encoding, when present, must be a single `chunked' value: no
+  other coding is implemented by hackney. Omitted (`undefined') header
+  values are removed from the actual outgoing list after all header
+  producers run. Chunked bodies use separate header/body writes so the
+  request line is never chunk-framed. Every other name accepts every half
+- the `cookie' option is a binary, `{Name, Value}', `{Name, Value, Opts}'
+  or a list of those — the `{cookie, string()}' form the legacy
+  `server_connection/4' doc named is refused, hackney would write a string
+  as one integer cookie per character. Cookie options, when present, must
+  be `secure'/`http_only' = true, a nonnegative integer `max_age', and a
+  binary/iodata `domain'/`path' carrying no control, `;' or `,'
+- the `basic_auth' option must be `{User, Password}' with halves
+  `hackney_bstr:to_binary/1' renders and no CR/LF, and `insecure_basic_auth'
+  must resolve to a boolean (request option, then hackney app default),
+  including when credentials come from URL userinfo; otherwise
+  `{error, {unsafe_header, <<"Authorization">>}}'
+- a streamed multipart body must carry a boundary that is both an RFC 2046
+  boundary and an HTTP token (1 to 70 characters of DIGIT / ALPHA /
+  `'+_-.', since hackney writes `boundary=' unquoted) and a size that is
+  `chunked' or a nonnegative integer; otherwise
+  `{error, {unsafe_header, Name}}' names `Content-Type' or `Content-Length'
+- `follow_redirect', `proxy' and `path_encode_fun' options are refused with
+  `{error, {unsupported_option, Option}}', the bare atom form included —
+  hackney reads its options with `proplists', where a bare atom is the
+  option set to `true'. Environment proxies are the caller's to disable
+  (`no_proxy_env'): under one, hackney writes the whole URL as the request
+  target through `hackney_url:unparse_url/1', which urlencodes the
+  credentials and drops the already-refused fragment, so the request line
+  stays whole but the netloc distinction above no longer holds
+
+Shape of the doors
+
 - all bounded doors require a `#db{}' first argument (function_clause on
-  another term); save_doc_bounded no longer returns invalid_document for a
-  non-db argument. Fetch input refusals precede budget creation; transport
-  refusals can occur later inside its budgeted stream.
+  another term); `save_doc_bounded/4' no longer returns `invalid_document'
+  for a non-db argument. Input refusals precede budget creation; the
+  transport refusals above happen after it, and on the view door inside its
+  budgeted stream
 
 version 1.7.1 / 2025-07-24
 ---------------------------
@@ -343,10 +414,3 @@ moved in couchbeam_oldview module.
 - couchbeam:wait_changes, couchbeam:wait_changes_once, couchbeam:changes
   functions have been deprecated and are now replaced by
 couchbeam_changes:stream and couchbeam_changes:fetch functions.
-
-Bounded transport also refuses caller-supplied `path_encode_fun` options,
-validates multipart boundaries that become Content-Type headers, and checks
-header field names as HTTP tokens. Header values reject C0 controls except HT,
-and DEL; Latin-1 value bytes remain accepted. Name validation rejects raw C0
-and DEL before opening a bounded operation. Malformed header list tails receive
-`{unsafe_header, undefined}` before header preparation.
