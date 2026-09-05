@@ -46,7 +46,8 @@
 %% `{TimeoutMs, MaxResponseBytes}': the first element is the absolute request
 %% deadline in milliseconds counted from `new_request_budget/1', the second one
 %% caps the cumulative raw response bytes.
--type request_budget_spec() :: {pos_integer(), pos_integer()}.
+-type request_budget_spec() :: {pos_integer(), pos_integer()} |
+                               {'receipt_budget', request_budget()}.
 -type request_budget() :: #{'deadline_ms' := integer(),
                             'timeout_ms' := pos_integer(),
                             'max_response_bytes' := pos_integer()}.
@@ -180,6 +181,11 @@ new_request_budget({TimeoutMs, MaxResponseBytes})
     {'ok', #{'deadline_ms' => erlang:monotonic_time('millisecond') + TimeoutMs,
              'timeout_ms' => TimeoutMs,
              'max_response_bytes' => MaxResponseBytes}};
+%% Internal carrier constructed by the v2 door; never rebuild its deadline.
+new_request_budget({'receipt_budget', #{'deadline_ms' := _, 'timeout_ms' := _,
+                                        'max_response_bytes' := _,
+                                        'receipt' := _}=Budget}) ->
+    {'ok', Budget};
 new_request_budget(_) ->
     {'error', 'invalid_request_budget'}.
 
@@ -566,6 +572,7 @@ bounded_body_chunk(Chunk, Ref,
                    #{'max_response_bytes' := MaxBytes}=Budget, Acc, Bytes) ->
     case is_binary(Chunk) of
         'true' ->
+            couchbeam_receipt:add_bytes(Budget, Chunk),
             NewBytes = Bytes + byte_size(Chunk),
             case NewBytes =< MaxBytes of
                 'true' -> bounded_body(
@@ -1205,9 +1212,14 @@ request_bounded_headers_checked(Method, Url, Headers, Body, Options, Budget,
                     FinalOptions = request_framing_options(
                                      FinalHeaders, AuthOptions),
                     RequestFun = fun() ->
-                                         request_prepared(
-                                           Method, Url, FinalHeaders, Body,
-                                           FinalOptions)
+                                         case remaining_timeout(Budget) of
+                                             N when N > 0 ->
+                                                 couchbeam_receipt:dispatch(Budget),
+                                                 request_prepared(
+                                                   Method, Url, FinalHeaders,
+                                                   Body, FinalOptions);
+                                             _ -> {'error', 'timeout'}
+                                         end
                                  end,
                     request_bounded_prepared(
                       Parent, LifecycleOwner, Token, RequestFun, Hooks,

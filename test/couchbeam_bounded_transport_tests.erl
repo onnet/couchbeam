@@ -1292,6 +1292,12 @@ bounded_body_close_propagates_cleanup_timeout_for_concrete_ref_test_() ->
     {'timeout', 30, fun bounded_body_close_propagates_cleanup_timeout_for_concrete_ref/0}.
 
 bounded_body_close_propagates_cleanup_timeout_for_concrete_ref() ->
+    body_cleanup_receipt(1).
+
+v2_body_cleanup_receipt_test_() ->
+    {'timeout', 30, fun() -> body_cleanup_receipt(2) end}.
+
+body_cleanup_receipt(Version) ->
     {'ok', _} = application:ensure_all_started('hackney'),
     Parent = self(),
     Body = <<"{\"db_name\":\"db\"}">>,
@@ -1312,8 +1318,10 @@ bounded_body_close_propagates_cleanup_timeout_for_concrete_ref() ->
               {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
               Caller = spawn(
                          fun() ->
-                                 Result = couchbeam:db_info_bounded(
-                                            Db, {100, 1024}),
+                                 Result = case Version of
+                                     1 -> couchbeam:db_info_bounded(Db, {100, 1024});
+                                     2 -> couchbeam:db_info_bounded_v2(Db, v2_spec(100, 1024))
+                                 end,
                                  Parent ! {'body_cleanup_result', self(),
                                            Result},
                                  receive
@@ -1326,19 +1334,19 @@ bounded_body_close_propagates_cleanup_timeout_for_concrete_ref() ->
                                  end,
                                  receive 'stop_body_cleanup_caller' -> 'ok' end
                          end),
-              {GuardianPid, LeasePid} = receive
+              {GuardianPid, LeasePid, Consumer} = receive
                   {'bounded_guardian_started_ready', Guardian, _Worker, Lease,
-                   Caller} ->
+                   RawConsumer} ->
                       Guardian ! {'bounded_guardian_started_continue',
                                   Guardian},
-                      {Guardian, Lease}
+                      {Guardian, Lease, RawConsumer}
               after 1000 ->
                       exit(Caller, 'kill'),
                       ?assert('false')
               end,
               Ref = receive
-                        {'bounded_handoff_ready', CapturedRef, Caller} ->
-                            Caller ! {'bounded_handoff_continue', CapturedRef},
+                        {'bounded_handoff_ready', CapturedRef, Consumer} ->
+                            Consumer ! {'bounded_handoff_continue', CapturedRef},
                             CapturedRef
                     after 1000 ->
                             ?assert('false')
@@ -1367,7 +1375,11 @@ bounded_body_close_propagates_cleanup_timeout_for_concrete_ref() ->
                   receive
                       {'body_cleanup_result', Caller, Result} ->
                           ?assertEqual(
-                             {'error', 'transport_cleanup_timeout'}, Result)
+                             case Version of
+                                 1 -> {'error', 'transport_cleanup_timeout'};
+                                 2 -> {'error', 'transport_cleanup_timeout',
+                                       (v2_receipt(1, byte_size(Body)))#{'certainty' := 'unknown'}}
+                             end, Result)
                   after 300 ->
                           ?assert('false')
                   end,
@@ -8562,3 +8574,170 @@ request_line_assertion_rejects_a_prefixed_request_test() ->
     Request = <<"88\r\nGET /db HTTP/1.1\r\n\r\n">>,
     ?assertException('error', {'assertEqual', _},
                      assert_request_line(<<"GET /db HTTP/1.1">>, Request)).
+
+%% V2 raw receipts survive semantic/decode failures at the public doors.
+v2_error_receipts_test_() ->
+    [?_test(v2_body_receipt(Kind, Body, Cap, 'error'))
+     || {Kind, Body, Cap} <-
+            [{'db', <<"[]">>, 64}, {'doc', <<"[]">>, 64},
+             {'doc', <<"not json">>, 64},
+             {'save', <<"{\"ok\":true,\"id\":\"doc\"}">>, 64},
+             {'save', <<"{\"ok\":true,\"id\":\"doc\"}">>, 10},
+             {'view', <<"not json">>, 64},
+             {'view', <<"{\"rows\":[">>, 64},
+             {'view', <<"{\"rows\":[]}">>, 3}]].
+
+v2_success_receipts_test_() ->
+    [?_test(v2_body_receipt(Kind, Body, 128, 'ok'))
+     || {Kind, Body} <- [{'db', <<"{}">>}, {'doc', <<"{}">>},
+                        {'save', <<"{\"id\":\"doc\",\"rev\":\"1-a\"}">>},
+                        {'view', <<"{\"rows\":[]}">>},
+                        {'create', <<"{\"ok\":true}">>}]].
+
+v2_body_receipt(Kind, Body, Cap, Tag) ->
+    ensure_couchbeam_supervisor(),
+    with_http_server(
+      fun(Socket, Parent) ->
+              Status = case Kind of 'save' -> 201; 'create' -> 201; _ -> 200 end,
+              'ok' = send_json_headers(Socket, Status, byte_size(Body)),
+              'ok' = gen_tcp:send(Socket, Body),
+              Parent ! {'server_done', self()}
+      end,
+      fun(Url) ->
+              Result = v2_call(Kind, v2_db(Url), v2_spec(1000, Cap)),
+              ?assertMatch({Tag, _, _}, Result),
+              ?assertEqual(v2_receipt(1, byte_size(Body)), element(3, Result))
+      end).
+
+v2_partial_timeout_receipts_test_() ->
+    [?_test(begin
+                ensure_couchbeam_supervisor(),
+                Body = <<"{\"rows\":[">>,
+                with_http_server(
+                  fun(Socket, Parent) ->
+                          'ok' = send_chunked_headers(Socket),
+                          'ok' = send_http_chunk(Socket, Body),
+                          _ = recv_until_closed(Socket),
+                          Parent ! {'server_done', self()}
+                  end,
+                  fun(Url) ->
+                          ?assertEqual({'error', 'timeout', v2_receipt(1, byte_size(Body))},
+                                       v2_call(Kind, v2_db(Url), v2_spec(150, 64)))
+                  end)
+            end) || Kind <- ['doc', 'view']].
+
+v2_expired_deadline_zero_io_test_() ->
+    [?_test(begin
+                Result = refused_before_transport(
+                           fun(Db) -> v2_call(Kind, Db, v2_spec(-1, 64)) end, []),
+                ?assertEqual({'error', 'timeout', v2_receipt(0, 0)}, Result)
+            end) || Kind <- ['db', 'doc', 'save', 'view', 'create']].
+
+v2_db(Url) ->
+    Server = couchbeam:server_connection(Url, [{'no_proxy_env', 'true'}]),
+    {'ok', Db} = couchbeam:open_db(Server, <<"db">>),
+    Db.
+
+v2_spec(Timeout, Cap) ->
+    {'bounded_reader', 2, erlang:monotonic_time('millisecond') + Timeout, Cap}.
+
+v2_receipt(Calls, Bytes) ->
+    #{'version' => 2, 'dispatch_count' => Calls,
+      'body_bytes' => Bytes, 'certainty' => 'known'}.
+
+v2_call('create', #db{server=Server, name=Name}, Spec) ->
+    couchbeam:create_db_bounded_v2(Server, Name, Spec);
+v2_call('db', Db, Spec) -> couchbeam:db_info_bounded_v2(Db, Spec);
+v2_call('doc', Db, Spec) -> couchbeam:open_doc_bounded_v2(Db, <<"doc">>, [], Spec);
+v2_call('save', Db, Spec) ->
+    couchbeam:save_doc_bounded_v2(Db, {[{<<"_id">>, <<"doc">>}]}, [], Spec);
+v2_call('view', Db, Spec) -> couchbeam_view:fetch_bounded_v2(Db, 'all_docs', [], Spec).
+
+v2_view_preflight_receipt_test() ->
+    Result = refused_before_transport(
+               fun(Db) -> couchbeam_view:fetch_bounded_v2(
+                            Db, 'all_docs', [{'stale', 'bogus'}], v2_spec(1000, 64)) end, []),
+    ?assertEqual({'error', {'invalid_param', {'stale', 'bogus'}}, v2_receipt(0, 0)}, Result).
+
+v2_exception_after_dispatch_keeps_unknown_and_closes_peer_test() ->
+    ensure_couchbeam_supervisor(),
+    with_http_server(
+      fun(Socket, Parent) ->
+              'ok' = send_json_response(Socket, <<"{}">>),
+              Parent ! {'v2_exception_peer', recv_until_closed(Socket)},
+              Parent ! {'server_done', self()}
+      end,
+      fun(Url) ->
+              Result = couchbeam_receipt:call(
+                         fun(Carrier) ->
+                                 {'ok', Budget} = couchbeam_httpc:new_request_budget(Carrier),
+                                 {'ok', 200, _, _Ref} = couchbeam_httpc:db_request_bounded(
+                                    'get', <<Url/binary, "/db">>, [], <<>>,
+                                    [{'no_proxy_env', 'true'}], [200], Budget),
+                                 error('after_dispatch')
+                         end, v2_spec(1000, 64), 'direct'),
+              ?assertEqual({'error', 'bounded_transport_failure',
+                            (v2_receipt(1, 0))#{'certainty' := 'unknown'}}, Result),
+              receive
+                  {'v2_exception_peer', Closed} -> ?assertEqual({'error', 'closed'}, Closed)
+              after 1500 -> ?assert('false')
+              end
+      end).
+
+v2_delayed_dispatch_obeys_original_deadline_test() ->
+    Hook = spawn(fun() ->
+                         receive
+                             {'bounded_guardian_ready', Guardian, _Consumer} ->
+                                 receive after 100 -> 'ok' end,
+                                 Guardian ! {'bounded_guardian_continue', Guardian}
+                         after 1000 -> 'ok'
+                         end
+                 end),
+    try
+        Result = refused_before_transport(
+                   fun(Db) -> couchbeam:db_info_bounded_v2(Db, v2_spec(40, 64)) end,
+                   [{'bounded_guardian_ready_test_hook', Hook}]),
+        ?assertEqual({'error', 'timeout', v2_receipt(0, 0)}, Result)
+    after exit(Hook, 'kill')
+    end.
+
+
+v2_create_refuses_unsafe_database_test_() ->
+    [?_test(begin
+                Result = refused_before_transport(
+                           fun(#db{server=Server}) ->
+                               couchbeam:create_db_bounded_v2(
+                                 Server, Name, v2_spec(1000, 64))
+                           end, []),
+                ?assertEqual({'error', {'unsafe_db_name', Name},
+                              v2_receipt(0, 0)}, Result)
+            end) || Name <- [<<>>, <<"/">>, <<"..">>, <<"%2E%2E">>,
+                            <<"db?other=true">>, <<"db#fragment">>,
+                            <<"db/other">>, <<"bad db">>]].
+
+v2_refuses_generated_header_before_dispatch_test_() ->
+    [?_test(begin
+                ensure_couchbeam_supervisor(),
+                Result = refused_before_transport(
+                           fun(Db) -> v2_call(Kind, Db, v2_spec(1000, 64)) end,
+                           [{'cookie', {<<"session">>, <<"x\r\ny">>}}]),
+                ?assertEqual({'error', {'unsafe_header', <<"Cookie">>},
+                              v2_receipt(0, 0)}, Result)
+            end) || Kind <- ['db', 'doc', 'save', 'view', 'create']].
+
+v2_create_unconfirmed_keeps_receipt_test_() ->
+    ?_test(begin
+        ensure_couchbeam_supervisor(),
+        Body = <<"{\"ok\":true}">>,
+        with_http_server(
+          fun(Socket, Parent) ->
+              'ok' = send_json_headers(Socket, 202, byte_size(Body)),
+              'ok' = gen_tcp:send(Socket, Body),
+              Parent ! {'server_done', self()}
+          end,
+          fun(Url) ->
+              ?assertEqual({'error', 'db_create_unconfirmed',
+                            v2_receipt(1, byte_size(Body))},
+                           v2_call('create', v2_db(Url), v2_spec(1000, 64)))
+          end)
+    end).

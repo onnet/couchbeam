@@ -101,6 +101,7 @@ init_stream(Parent, Owner, StreamRef, {_Db, _Url, _Args}=Req,
                 %% start the loop
                 loop(State);
             Error ->
+                couchbeam_receipt:complete(Budget),
                 report_error(Error, StreamRef, Owner)
         end
     after
@@ -282,6 +283,7 @@ complete_stream(#state{owner=Owner, ref=StreamRef,
                        client_ref=ClientRef, budget=Budget}=State) ->
     CleanupResult = maybe_cancel_request(ClientRef, Budget),
     ets:delete(couchbeam_view_streams, StreamRef),
+    couchbeam_receipt:complete(State#state.budget),
     case CleanupResult of
         'ok' ->
             notify_owner_cleanup_proven(State),
@@ -574,6 +576,7 @@ add_response_bytes(_Data, #state{budget='undefined'}=State) ->
     {'ok', State};
 add_response_bytes(Data, #state{budget=Budget,
                                 response_bytes=Bytes}=State) ->
+    couchbeam_receipt:add_bytes(Budget, Data),
     case budget_status(State) of
         {'error', 'timeout'}=Error ->
             Error;
@@ -591,6 +594,7 @@ fail_stream(Reason, #state{owner=Owner, ref=StreamRef,
                            client_ref=ClientRef}=State) ->
     CleanupResult = couchbeam_httpc:cancel_request(ClientRef),
     ets:delete(couchbeam_view_streams, StreamRef),
+    couchbeam_receipt:complete(State#state.budget),
     case CleanupResult of
         'ok' ->
             notify_owner_cleanup_proven(State),

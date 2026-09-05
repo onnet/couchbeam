@@ -8,6 +8,9 @@
 
 -include("couchbeam.hrl").
 
+-export([fetch_bounded_v2/4]).
+-bounded_reader_v2_capability({'bounded_reader', 2}).
+
 -export([stream/2, stream/3,
          cancel_stream/1, stream_next/1,
          fetch/1, fetch/2, fetch/3,
@@ -1297,3 +1300,9 @@ view_notfound_test() ->
 
 
 -endif.
+
+-spec fetch_bounded_v2(db(), 'all_docs' | {binary(), binary()}, list(),
+                       couchbeam_receipt:spec()) -> couchbeam_receipt:result().
+fetch_bounded_v2(Db, View, Options, Spec) ->
+    couchbeam_receipt:call(fun(B) -> fetch_bounded(Db, View, Options, B) end,
+                           Spec, 'stream').
