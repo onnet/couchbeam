@@ -15,6 +15,7 @@
 
 %% API urls
 -export([db_info_bounded_v2/2, open_doc_bounded_v2/4, save_doc_bounded_v2/4]).
+-export([create_db_bounded_v2/3]).
 -bounded_reader_v2_capability({'bounded_reader', 2}).
 
 -export([server_connection/0, server_connection/1,
@@ -1756,3 +1757,34 @@ open_doc_bounded_v2(Db, Id, Options, Spec) ->
 save_doc_bounded_v2(Db, Doc, Options, Spec) ->
     couchbeam_receipt:call(fun(B) -> save_doc_bounded(Db, Doc, Options, B) end,
                            Spec, 'direct').
+
+-spec create_db_bounded_v2(server(), binary(), couchbeam_receipt:spec()) ->
+          couchbeam_receipt:result().
+create_db_bounded_v2(Server, DbName, Spec) ->
+    couchbeam_receipt:call(fun(B) -> create_db_bounded(Server, DbName, B) end,
+                           Spec, 'direct').
+
+-spec create_db_bounded(server(), binary(), couchbeam_httpc:request_budget_spec()) ->
+          {'ok', 'created', non_neg_integer()} | {'error', term()}.
+create_db_bounded(#server{options=Options}=Server, DbName, Spec) ->
+    case couchbeam_httpc:new_request_budget(Spec) of
+        {'ok', Budget} ->
+            Url = hackney_url:make_url(couchbeam_httpc:server_url(Server), DbName, []),
+            case couchbeam_httpc:db_request_bounded(
+                   'put', Url, [], <<>>, Options, [201, 202], Budget) of
+                {'ok', Status, _, Ref} ->
+                    created_db_result(Status, couchbeam_httpc:bounded_json_body(Ref, Budget));
+                Error -> Error
+            end;
+        Error -> Error
+    end.
+
+-spec created_db_result(integer(), term()) ->
+          {'ok', 'created', non_neg_integer()} | {'error', term()}.
+created_db_result(201, {'ok', {[{<<"ok">>, 'true'}]}, Bytes}) ->
+    {'ok', 'created', Bytes};
+created_db_result(202, {'ok', _, _}) ->
+    {'error', 'db_create_unconfirmed'};
+created_db_result(_, {'ok', _, _}) ->
+    {'error', 'invalid_db_create_response'};
+created_db_result(_, {'error', _}=Error) -> Error.
