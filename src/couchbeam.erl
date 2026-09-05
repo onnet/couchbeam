@@ -14,6 +14,9 @@
 -define(TIMEOUT, infinity).
 
 %% API urls
+-export([db_info_bounded_v2/2, open_doc_bounded_v2/4, save_doc_bounded_v2/4]).
+-bounded_reader_v2_capability({'bounded_reader', 2}).
+
 -export([server_connection/0, server_connection/1,
          server_connection/2, server_connection/4,
          server_info/1,
@@ -1737,3 +1740,19 @@ data_path(Basename) ->
 
 
 -endif.
+
+-spec db_info_bounded_v2(db(), couchbeam_receipt:spec()) -> couchbeam_receipt:result().
+db_info_bounded_v2(Db, Spec) ->
+    couchbeam_receipt:call(fun(B) -> db_info_bounded(Db, B) end, Spec, 'direct').
+
+-spec open_doc_bounded_v2(db(), docid(), list(), couchbeam_receipt:spec()) ->
+          couchbeam_receipt:result().
+open_doc_bounded_v2(Db, Id, Options, Spec) ->
+    couchbeam_receipt:call(fun(B) -> open_doc_bounded(Db, Id, Options, B) end,
+                           Spec, 'direct').
+
+-spec save_doc_bounded_v2(db(), doc(), list(), couchbeam_receipt:spec()) ->
+          couchbeam_receipt:result().
+save_doc_bounded_v2(Db, Doc, Options, Spec) ->
+    couchbeam_receipt:call(fun(B) -> save_doc_bounded(Db, Doc, Options, B) end,
+                           Spec, 'direct').
