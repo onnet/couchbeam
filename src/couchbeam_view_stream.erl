@@ -345,7 +345,7 @@ decode_data_bounded(Data, #state{decoder=Decoder,
                                  decode_test_delay_ms=Delay}=State) ->
     Parent = self(),
     Token = make_ref(),
-    {DecoderPid, MonitorRef} = spawn_monitor(
+    {DecoderPid, MonitorRef} = hackney_process:spawn_monitor(
                                  fun() ->
                                          maybe_delay_decode(Delay),
                                          Parent ! {Token,

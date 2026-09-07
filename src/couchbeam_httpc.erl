@@ -75,7 +75,11 @@ prepare_request(Method, Url, Headers, Options, Budget) ->
 
 -spec request_prepared(term(), term(), list(), term(), list()) -> term().
 request_prepared(Method, Url, Headers, Body, Options) ->
-    hackney:request(Method, Url, Headers, Body, Options).
+    OwnedOptions = case hackney_process:owned() of
+        'true' -> [{'pool', 'false'} | lists:keydelete('pool', 1, Options)];
+        'false' -> Options
+    end,
+    hackney:request(Method, Url, Headers, Body, OwnedOptions).
 
 db_request(Method, Url, Headers, Body, Options) ->
     db_request(Method, Url, Headers, Body, Options, []).
@@ -439,7 +443,7 @@ run_bounded_worker(WorkFun, ResultFun, Budget) ->
 run_bounded_worker(WorkFun, ResultFun, Budget, TimeoutMs) ->
     Parent = self(),
     Token = make_ref(),
-    {WorkerPid, MonitorRef} = spawn_monitor(
+    {WorkerPid, MonitorRef} = hackney_process:spawn_monitor(
                                 fun() -> Parent ! {Token, WorkFun()} end),
     guard_ephemeral_worker(Parent, WorkerPid),
     receive
@@ -517,7 +521,7 @@ unsafe_multipart_size(_Size) ->
 %% that may be as large as `max_response_bytes'.
 -spec guard_ephemeral_worker(pid(), pid()) -> 'ok'.
 guard_ephemeral_worker(Parent, WorkerPid) ->
-    _ = spawn(fun() ->
+    _ = hackney_process:spawn(fun() ->
                       ParentRef = erlang:monitor('process', Parent),
                       WorkerRef = erlang:monitor('process', WorkerPid),
                       receive
@@ -625,7 +629,7 @@ decode_with_watchdog(Body, Bytes, Budget) ->
     Parent = self(),
     Token = make_ref(),
     Delay = caller_decode_test_delay(),
-    {DecoderPid, MonitorRef} = spawn_monitor(
+    {DecoderPid, MonitorRef} = hackney_process:spawn_monitor(
                                  fun() ->
                                          maybe_test_delay(Delay),
                                          Parent ! {Token,
@@ -1363,7 +1367,7 @@ request_bounded_prepared(Parent, LifecycleOwner, Token, RequestFun, Hooks,
                              request_identity()) ->
           {'ok', pid()} | {'error', 'timeout'}.
 start_request_guardian(Parent, LifecycleOwner, Token, Budget, Identity) ->
-    GuardianPid = spawn(
+    GuardianPid = hackney_process:spawn(
                     fun() ->
                             request_guardian_init(
                               Parent, LifecycleOwner, Token, Budget,
@@ -1414,9 +1418,9 @@ request_guardian_await_start(Parent, LifecycleOwner, Token, Budget,
                              OwnerMonitors, Identity) ->
     receive
         {Token, 'start', RequestFun, Hooks} ->
-            LeasePid = spawn(fun transport_lease/0),
+            LeasePid = hackney_process:spawn(fun transport_lease/0),
             WorkerHold = hook('worker_hold', Hooks),
-            WorkerPid = spawn(
+            WorkerPid = hackney_process:spawn(
                           fun() ->
                                   Result = RequestFun(),
                                   hold_worker(WorkerHold),
@@ -2339,7 +2343,7 @@ request_guardian_cleanup_ack(GuardianPid, Kind, Ref, CleanupBudget) ->
     Parent = self(),
     CleanupToken = make_ref(),
     AckBudget = cleanup_ack_deadline(CleanupBudget),
-    {RelayPid, RelayMonitor} = spawn_monitor(
+    {RelayPid, RelayMonitor} = hackney_process:spawn_monitor(
                                fun() ->
                                        guardian_cleanup_ack_relay(
                                          Parent, GuardianPid, CleanupToken,

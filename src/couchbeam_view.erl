@@ -783,10 +783,7 @@ stream_with_budget(Db, ViewName, Options0, Budget) ->
     make_view(Db, ViewName, Options1, fun(Args, Url) ->
                                               Ref = make_ref(),
                                               Req = {Db, Url, Args},
-                                              case supervisor:start_child(couchbeam_view_sup, [To,
-                                                                                               Ref,
-                                                                                               Req,
-                                                                                               StreamOptions]) of
+                                              case start_view_stream(To, Ref, Req, StreamOptions) of
                                                   {'ok', ViewPid} ->
                                                       stream_result(
                                                         Ref, ViewPid, Budget);
@@ -794,6 +791,22 @@ stream_with_budget(Db, ViewName, Options0, Budget) ->
                                                       Error
                                               end
                                       end).
+
+-spec start_view_stream(pid(), reference(), tuple(), list()) -> term().
+start_view_stream(To, Ref, Req, Options) ->
+    case hackney_process:owned() of
+        'false' -> supervisor:start_child(couchbeam_view_sup, [To, Ref, Req, Options]);
+        'true' ->
+            Parent = self(),
+            {Pid, Monitor} = hackney_process:spawn_monitor(fun() ->
+                couchbeam_view_stream:init_stream(Parent, To, Ref, Req, Options)
+            end),
+            receive
+                {'ack', Pid, {'ok', Pid}} ->
+                    erlang:demonitor(Monitor, ['flush']), {'ok', Pid};
+                {'DOWN', Monitor, 'process', Pid, Reason} -> {'error', Reason}
+            end
+    end.
 
 -spec stream_result(reference(), pid(),
                     'undefined' | couchbeam_httpc:request_budget()) ->
@@ -845,6 +858,12 @@ get_kz_application() ->
 
 cancel_stream(Ref) ->
     with_view_stream(Ref, fun(Pid) ->
+                          case hackney_process:owned() of
+                              'true' ->
+                                  Monitor = monitor('process', Pid),
+                                  exit(Pid, 'kill'),
+                                  receive {'DOWN', Monitor, 'process', Pid, _} -> 'ok' end;
+                              'false' ->
                                   case supervisor:terminate_child(couchbeam_view_sup, Pid) of
                                       ok ->
                                           case supervisor:delete_child(couchbeam_view_sup,
@@ -859,6 +878,7 @@ cancel_stream(Ref) ->
                                       Error ->
                                           Error
                                   end
+                          end
                           end).
 
 stream_next(Ref) ->
