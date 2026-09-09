@@ -14,7 +14,7 @@
 -export([stream/2, stream/3,
          cancel_stream/1, stream_next/1,
          fetch/1, fetch/2, fetch/3,
-         fetch_bounded/4,
+         fetch_bounded/4, fetch_envelope/3,
          count/1, count/2, count/3,
          first/1, first/2, first/3,
          all/1, all/2,
@@ -633,11 +633,27 @@ fetch_sync(Db, ViewName, Options) ->
     make_view(Db, ViewName, Options, fetch_sync_fun(Db)).
 
 fetch_sync_fun(Db) ->
+    fetch_sync_fun(Db, fun({Props}) ->
+        {ok, couchbeam_util:get_value(<<"rows">>, Props)}
+    end).
+
+%% One synchronous attempt through the ordinary view request. The Kazoo
+%% caller owns retries; retaining the complete object keeps rows and sequence
+%% from the same response, including a missing sequence on empty results.
+-spec fetch_envelope(db(), 'all_docs' | {binary(), binary()}, list()) ->
+          {'ok', ejson_term()} | {'error', term()}.
+fetch_envelope(Db, ViewName, Options) ->
+    make_view(Db, ViewName, Options,
+              fetch_sync_fun(Db, fun
+                  ({'error', _} = Error) -> Error;
+                  (Json) -> {'ok', Json}
+              end)).
+
+fetch_sync_fun(Db, Decode) ->
     fun(Args, Url) ->
         case view_request(Db, Url, Args) of
             {ok, _, _, Ref} ->
-                {Props} = couchbeam_httpc:json_body(Ref),
-                {ok, couchbeam_util:get_value(<<"rows">>, Props)};
+                Decode(couchbeam_httpc:json_body(Ref));
             Error ->
                 Error
         end
@@ -1080,6 +1096,10 @@ parse_view_options([{stable, true}|Rest], #view_query_args{options=Opts}=Args) -
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{stable, false}|Rest], #view_query_args{options=Opts}=Args) ->
     Opts1 = [{stable, "false"}|Opts],
+    parse_view_options(Rest, Args#view_query_args{options=Opts1});
+parse_view_options([{'update_seq', Value}|Rest], #view_query_args{options=Opts}=Args)
+  when is_boolean(Value) ->
+    Opts1 = [{'update_seq', atom_to_list(Value)}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{update, true}|Rest], #view_query_args{options=Opts}=Args) ->
     Opts1 = [{update, "true"}|Opts],

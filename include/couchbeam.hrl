@@ -92,6 +92,7 @@
     | {stale, stale()}
     | {stable, boolean()}
     | {update, atom()}
+    | {'update_seq', boolean()}
     | descending
     | {skip, integer()}
     | group | {group_level, exact | integer()}
