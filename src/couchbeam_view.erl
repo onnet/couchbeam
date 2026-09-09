@@ -1098,7 +1098,7 @@ parse_view_options([{stable, false}|Rest], #view_query_args{options=Opts}=Args) 
     Opts1 = [{stable, "false"}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{'update_seq', Value}|Rest], #view_query_args{options=Opts}=Args)
-  when is_boolean(Value) ->
+  when is_boolean(Value); Value =:= group ->
     Opts1 = [{'update_seq', atom_to_list(Value)}|Opts],
     parse_view_options(Rest, Args#view_query_args{options=Opts1});
 parse_view_options([{update, true}|Rest], #view_query_args{options=Opts}=Args) ->
