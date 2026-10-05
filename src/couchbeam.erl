@@ -15,6 +15,7 @@
 
 %% API urls
 -export([db_info_bounded_v2/2, open_doc_bounded_v2/4, save_doc_bounded_v2/4]).
+-export([save_doc_status_bounded_v2/4]).
 -export([create_db_bounded_v2/3]).
 -bounded_reader_v2_capability({'bounded_reader', 2}).
 
@@ -768,7 +769,24 @@ save_doc(Db, Doc, Options) ->
 -spec save_doc_bounded(db(), doc(), list(),
                        couchbeam_httpc:request_budget_spec()) ->
           {'ok', doc(), non_neg_integer()} | {'error', term()}.
-save_doc_bounded(#db{name=DbName}=Db, Doc, Options, BudgetSpec) ->
+save_doc_bounded(#db{}=Db, Doc, Options, BudgetSpec) ->
+    case save_doc_status_bounded(Db, Doc, Options, BudgetSpec) of
+        {'ok', #{'document' := Saved}, Bytes} -> {'ok', Saved, Bytes};
+        {'error', _}=Error -> Error
+    end.
+
+%% A 2xx write keeps its HTTP status: a clustered CouchDB answers 202 when the
+%% write reached fewer replicas than its write quorum -- the loser of a race on
+%% one `_rev' gets 202 with the same `{ok, id, rev}' body a 201 carries, so the
+%% status is the only witness of quorum. `save_doc_bounded/4' keeps its
+%% historical shape by dropping the status; this door is otherwise identical.
+-type status_save_result() ::
+          {'ok', #{'http_status' := integer(), 'document' := doc()}, non_neg_integer()}
+        | {'error', term()}.
+
+-spec save_doc_status_bounded(db(), doc(), list(),
+                              couchbeam_httpc:request_budget_spec()) -> status_save_result().
+save_doc_status_bounded(#db{name=DbName}=Db, Doc, Options, BudgetSpec) ->
     %% Like every bounded door, a first argument that is not a `#db{}' is a
     %% `function_clause' -- the type is the contract, not a refusal.
     case couchbeam_httpc:addressable(DbName) of
@@ -778,7 +796,7 @@ save_doc_bounded(#db{name=DbName}=Db, Doc, Options, BudgetSpec) ->
 
 -spec save_doc_bounded_addressed(db(), term(), term(),
                                  couchbeam_httpc:request_budget_spec()) ->
-          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+          status_save_result().
 save_doc_bounded_addressed(#db{server=Server, options=Opts}=Db,
                            {Props}=Doc, Options, BudgetSpec)
   when is_list(Props), length(Props) >= 0 ->
@@ -805,7 +823,7 @@ save_doc_bounded_addressed(_Db, _Doc, _Options, _BudgetSpec) ->
 
 -spec save_doc_bounded_guarded(term(), list(), db(), doc(), docid(), term(),
                                couchbeam_httpc:request_budget_spec()) ->
-          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+          status_save_result().
 save_doc_bounded_guarded(Server, Opts, Db, Doc, DocId, Options, BudgetSpec) ->
     %% Sequenced, not paired in a tuple: a tuple would evaluate
     %% `has_batch_option/1' on a list the shape scan is about to refuse, and
@@ -820,7 +838,7 @@ save_doc_bounded_guarded(Server, Opts, Db, Doc, DocId, Options, BudgetSpec) ->
 
 -spec save_doc_bounded_batchless(term(), list(), db(), doc(), docid(), list(),
                                  couchbeam_httpc:request_budget_spec()) ->
-          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+          status_save_result().
 save_doc_bounded_batchless(Server, Opts, Db, Doc, DocId, Options,
                            BudgetSpec) ->
     case has_batch_option(Options) of
@@ -856,7 +874,7 @@ is_batch_key(_Key) -> 'false'.
         term(), list(), db(), doc(), docid(), list(),
         {'ok', couchbeam_httpc:request_budget()} |
         {'error', 'invalid_request_budget'}) ->
-          {'ok', doc(), non_neg_integer()} | {'error', term()}.
+          status_save_result().
 save_doc_bounded_checked(_Server, _Opts, _Db, _Doc, _DocId, _Options,
                          {'error', _}=Error) ->
     Error;
@@ -872,8 +890,12 @@ save_doc_bounded_checked(Server, Opts, Db, Doc, DocId, Options,
             case couchbeam_httpc:db_request_bounded(
                    'put', Url, Headers, EncodedDoc, Opts,
                    [200, 201, 202], Budget) of
-                {'ok', _, _, Ref} ->
-                    bounded_saved_doc(Ref, Budget, DocId, Doc);
+                {'ok', Status, _, Ref} ->
+                    case bounded_saved_doc(Ref, Budget, DocId, Doc) of
+                        {'ok', Saved, Bytes} ->
+                            {'ok', #{'http_status' => Status, 'document' => Saved}, Bytes};
+                        {'error', _}=Error -> Error
+                    end;
                 Error ->
                     Error
             end;
@@ -1842,6 +1864,14 @@ open_doc_bounded_v2(Db, Id, Options, Spec) ->
           couchbeam_receipt:result().
 save_doc_bounded_v2(Db, Doc, Options, Spec) ->
     couchbeam_receipt:call(fun(B) -> save_doc_bounded(Db, Doc, Options, B) end,
+                           Spec, 'direct').
+
+%% Status is kept inside the result value so v2 accounting remains unchanged.
+%% A 202 is an unresolved write; callers must never interpret it as quorum.
+-spec save_doc_status_bounded_v2(db(), doc(), list(), couchbeam_receipt:spec()) ->
+          couchbeam_receipt:result().
+save_doc_status_bounded_v2(Db, Doc, Options, Spec) ->
+    couchbeam_receipt:call(fun(B) -> save_doc_status_bounded(Db, Doc, Options, B) end,
                            Spec, 'direct').
 
 -spec create_db_bounded_v2(server(), binary(), couchbeam_receipt:spec()) ->
