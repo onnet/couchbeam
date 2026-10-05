@@ -32,7 +32,7 @@ call(_Fun, _Spec, _Mode) ->
 run(Fun, #{'deadline_ms' := Deadline, 'timeout_ms' := Timeout}=Budget, Mode) ->
     Parent = self(),
     Token = make_ref(),
-    {Worker, Monitor} = spawn_monitor(
+    {Worker, Monitor} = hackney_process:spawn_monitor(
                           fun() ->
                                   couchbeam_httpc:guard_ephemeral_worker(Parent, self()),
                                   Parent ! {Token, invoke(Fun, Budget)}

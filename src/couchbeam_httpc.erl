@@ -9,7 +9,7 @@
          db_request/5, db_request/6, db_request_bounded/7,
          guard_ephemeral_worker/2,
          json_body/1,
-         bounded_json_body/2,
+         bounded_json_body/2, bounded_binary_body/2, bounded_request/6,
          bounded_encode_json/2, bounded_encode_json/3,
          new_request_budget/1,
          invalid_query_param/1,
