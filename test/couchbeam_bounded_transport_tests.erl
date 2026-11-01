@@ -1931,6 +1931,35 @@ bounded_body_of_exactly_max_bytes_succeeds_test() ->
                  couchbeam:db_info_bounded(Db, {1000, byte_size(Body)}))
       end).
 
+%% A completed bounded call ends its transport lease with `shutdown': the end
+%% of the lease is its job, not a crash. Spawned under a `hackney_process'
+%% owner the lease is a supervised `proc_lib' child, and a `killed' exit is
+%% logged there as a crash report for every call (Kazoo zdocs, 02.11.2026:
+%% one `child_terminated ... killed' per bounded request of the hourly walk).
+bounded_close_ends_lease_with_shutdown_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    Body = <<"ok">>,
+    with_http_server(
+      fun(Socket, Parent) ->
+              send_json_response(Socket, Body),
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              {'ok', Budget} = couchbeam_httpc:new_request_budget({1000, 1000}),
+              {'ok', 200, _, Ref} = couchbeam_httpc:bounded_request(
+                                      'get', BaseUrl, [], <<>>,
+                                      [{'no_proxy_env', 'true'}], Budget),
+              {LeasePid, _GuardianPid, _} = get({'bounded_request_owner', Ref}),
+              Monitor = erlang:monitor('process', LeasePid),
+              ?assertEqual({'ok', Body, byte_size(Body)},
+                           couchbeam_httpc:bounded_binary_body(Ref, Budget)),
+              receive
+                  {'DOWN', Monitor, 'process', LeasePid, Reason} ->
+                      ?assertEqual('shutdown', Reason)
+              after 1000 -> ?assert('false')
+              end
+      end).
+
 bounded_view_of_exactly_max_bytes_succeeds_test() ->
     ensure_couchbeam_supervisor(),
     Body = <<"{\"total_rows\":0,\"offset\":0,\"rows\":[]}">>,

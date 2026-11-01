@@ -173,7 +173,7 @@ filter_undefined_headers(Headers) ->
 %% stream → collector.
 %% One cost is not in the budget and belongs in the caller's plan: a bounded
 %% call never returns its connection to hackney's pool. Every terminal path
-%% goes through `close_request/1', which kills the transport lease, and the
+%% goes through `close_request/1', which ends the transport lease, and the
 %% manager closes the socket -- so unlike the legacy path, each call pays a
 %% fresh connect (and TLS handshake).
 -spec new_request_budget(request_budget_spec()) ->
@@ -1851,7 +1851,8 @@ cancel_and_flush(GuardianPid, Token, Budget, Result) ->
     Final.
 
 %% The lease has one job: to stay alive as the tracked `hackney' owner until
-%% the guardian kills it. Nothing is ever sent to it.
+%% it is ended (`close_request/1', or the guardian). Nothing is ever sent to
+%% it, and it never traps exits: `shutdown' ends it like `kill'.
 -spec transport_lease() -> no_return().
 transport_lease() ->
     receive after 'infinity' -> 'ok' end.
@@ -2044,14 +2045,14 @@ cleanup_result('ok', Result) ->
 cleanup_result({'error', 'transport_cleanup_timeout'}=Error, _Result) ->
     Error.
 
-%% Re-point the tracked owner of `Ref' at the (already killed) lease. Two
+%% Re-point the tracked owner of `Ref' at the (already ended) lease. Two
 %% cases, one call: before the hand-off the worker is still the tracked owner,
 %% and `hackney_manager' answers `controlling_process' by linking the new
 %% owner — linking a dead pid delivers `{'EXIT', LeasePid, noproc}' to the
 %% manager, whose owner-exit handling closes the socket and drops the
 %% `hackney_manager_refs' row. After the hand-off the lease already is the
 %% tracked owner, the manager answers `ok' without linking, and the socket is
-%% closed by the lease's own `killed' exit; the call is then purely an
+%% closed by the lease's own exit; the call is then purely an
 %% ordering barrier. Either way the synchronous call orders this guardian
 %% behind everything the manager already had queued — except while the manager
 %% is `sys'-suspended, where `sys:get_state/2' is answered by the suspend loop
@@ -2787,7 +2788,15 @@ remaining_timeout(#{'deadline_ms' := DeadlineMs}) ->
 close_request(Ref) ->
     case erase({'bounded_request_owner', Ref}) of
         {LeasePid, GuardianPid, Budget} ->
-            exit(LeasePid, 'kill'),
+            %% The end of the lease is its job, not a crash: `shutdown' stops
+            %% it as surely as `kill' (`transport_lease/0' never traps exits),
+            %% and the manager closes the socket on any owner exit. Spawned
+            %% through `hackney_process' under an owner, the lease is a
+            %% supervised `proc_lib' child, and a `killed' exit there is
+            %% logged as a crash on every bounded call; `shutdown' is not.
+            %% The guardian's own `kill' (`maybe_stop_guardian_lease/2')
+            %% stays the fallback when this signal is not obeyed.
+            exit(LeasePid, 'shutdown'),
             CleanupResult = request_guardian_cleanup_complete(
                               GuardianPid, [LeasePid], Ref, Budget),
             flush_response_messages(Ref),
