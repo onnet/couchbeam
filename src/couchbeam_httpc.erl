@@ -8,6 +8,7 @@
 -export([request/5, request_bounded/6, request_bounded/7,
          db_request/5, db_request/6, db_request_bounded/7,
          guard_ephemeral_worker/2,
+         release_ephemeral_guard/1,
          json_body/1,
          bounded_json_body/2, bounded_binary_body/2, bounded_request/6,
          bounded_encode_json/2, bounded_encode_json/3,
@@ -445,21 +446,30 @@ run_bounded_worker(WorkFun, ResultFun, Budget, TimeoutMs) ->
     Token = make_ref(),
     {WorkerPid, MonitorRef} = hackney_process:spawn_monitor(
                                 fun() -> Parent ! {Token, WorkFun()} end),
-    guard_ephemeral_worker(Parent, WorkerPid),
+    Guard = guard_ephemeral_worker(Parent, WorkerPid),
+    %% Every branch returns only after the worker and its guard are both
+    %% gone: under a `hackney_process' owner they are this caller's helpers,
+    %% and the owner kills whatever of them is still alive when the caller
+    %% ends -- a `killed' crash report for a worker that had already answered
+    %% (`release_ephemeral_guard/1').
     receive
         {Token, Result} ->
-            erlang:demonitor(MonitorRef, ['flush']),
+            %% The worker exits right after this send.
+            await_ephemeral_down(WorkerPid, MonitorRef),
+            release_ephemeral_guard(Guard),
             case budget_status(Budget) of
                 'ok' -> ResultFun(Result);
                 {'error', 'timeout'} -> {'error', 'timeout'}
             end;
         {'DOWN', MonitorRef, 'process', WorkerPid, Reason} ->
+            release_ephemeral_guard(Guard),
             flush_request_result(Token),
             {'error', {'json_encoding_failed', Reason}}
     after TimeoutMs ->
             exit(WorkerPid, 'kill'),
             _ = await_worker_down(
                   WorkerPid, MonitorRef, cleanup_deadline(Budget)),
+            release_ephemeral_guard(Guard),
             flush_request_result(Token),
             {'error', 'timeout'}
     end.
@@ -514,24 +524,64 @@ unsafe_multipart_size(Size) when is_integer(Size), Size >= 0 ->
 unsafe_multipart_size(_Size) ->
     {'unsafe', <<"Content-Length">>}.
 
-%% @private Exported for `couchbeam_view_stream', not for consumers.
+%% @private Exported for `couchbeam_view_stream' and `couchbeam_receipt',
+%% not for consumers.
 %% @doc Bind an ephemeral worker's lifetime to `Parent'. A worker that is
 %% only reachable through a killable call must not outlive the process that
 %% wanted its result: without this the worker runs to completion on a body
-%% that may be as large as `max_response_bytes'.
--spec guard_ephemeral_worker(pid(), pid()) -> 'ok'.
+%% that may be as large as `max_response_bytes'. Answers the guard's pid,
+%% which the calling process hands to `release_ephemeral_guard/1' once it is
+%% done with the worker.
+-spec guard_ephemeral_worker(pid(), pid()) -> pid().
 guard_ephemeral_worker(Parent, WorkerPid) ->
-    _ = hackney_process:spawn(fun() ->
+    hackney_process:spawn(fun() ->
                       ParentRef = erlang:monitor('process', Parent),
                       WorkerRef = erlang:monitor('process', WorkerPid),
                       receive
                           {'DOWN', ParentRef, 'process', Parent, _Reason} ->
                               exit(WorkerPid, 'kill');
                           {'DOWN', WorkerRef, 'process', WorkerPid, _Reason} ->
+                              'ok';
+                          {'release_ephemeral_guard', Self}
+                            when Self =:= self() ->
                               'ok'
                       end
-              end),
-    'ok'.
+              end).
+
+%% @private Exported for `couchbeam_view_stream' and `couchbeam_receipt',
+%% not for consumers.
+%% @doc End a guard from `guard_ephemeral_worker/2' normally and wait until it
+%% is gone. Called by whoever is done with the worker -- its result is in,
+%% or the worker is dead -- on every path, successful ones included. Under a
+%% `hackney_process' owner (Kazoo zdocs) the guard is a child of the owner's
+%% work supervisor, and the owner kills every helper still alive when the
+%% operation's process ends: a guard left waiting for the worker's `DOWN'
+%% after its caller returned was logged as `child_terminated ... killed' on
+%% about every second bounded write (Kazoo prod core11, 03.11.2026). The
+%% guard keeps its job until this call: a parent killed before it still
+%% takes the worker down.
+%%
+%% The monitor is placed here, not at spawn: a guard that already ended on
+%% the worker's `DOWN' answers it with `noproc' at once, and a process whose
+%% own receive loop consumes stray `DOWN' messages (the request guardian)
+%% cannot lose the one this wait needs. An unconditional wait, deliberately:
+%% the guard only waits in `receive', and the release message (or the
+%% worker's `DOWN' it is already handling) ends it, so the `DOWN' is bounded
+%% by the scheduler, not by a deadline.
+-spec release_ephemeral_guard(pid()) -> 'ok'.
+release_ephemeral_guard(GuardPid) ->
+    GuardRef = erlang:monitor('process', GuardPid),
+    GuardPid ! {'release_ephemeral_guard', GuardPid},
+    await_ephemeral_down(GuardPid, GuardRef).
+
+%% Unconditional for the reason given at `decode_with_watchdog/3': the
+%% process has finished its job (sent its last message) or was just killed,
+%% so `DOWN' is certain.
+-spec await_ephemeral_down(pid(), reference()) -> 'ok'.
+await_ephemeral_down(Pid, MonitorRef) ->
+    receive
+        {'DOWN', MonitorRef, 'process', Pid, _Reason} -> 'ok'
+    end.
 
 %% @doc Close a bounded request and prove its transport cleanup. Process
 %% affine: only the process that adopted `Ref' through `request_bounded/6,7'
@@ -635,19 +685,25 @@ decode_with_watchdog(Body, Bytes, Budget) ->
                                          Parent ! {Token,
                                                    decode_json_result(Body)}
                                  end),
-    guard_ephemeral_worker(Parent, DecoderPid),
+    Guard = guard_ephemeral_worker(Parent, DecoderPid),
     WatchdogMs = erlang:max(0, remaining_timeout(Budget)),
+    %% As in `run_bounded_worker/4': no branch returns while the decoder or
+    %% its guard is still alive.
     receive
         {Token, {'ok', Json}} ->
-            erlang:demonitor(MonitorRef, ['flush']),
+            %% The decoder exits right after this send.
+            await_ephemeral_down(DecoderPid, MonitorRef),
+            release_ephemeral_guard(Guard),
             guarded_decode_result({'ok', Json}, Bytes, Budget);
         {Token, {'error', _}=Error} ->
-            erlang:demonitor(MonitorRef, ['flush']),
+            await_ephemeral_down(DecoderPid, MonitorRef),
+            release_ephemeral_guard(Guard),
             guarded_decode_result(Error, Bytes, Budget);
         {'DOWN', MonitorRef, 'process', DecoderPid, Reason} ->
             %% The decoder catches its own JSON errors
             %% (`decode_json_result/1'); a `'DOWN'' is a decoder killed from
             %% outside — a transient failure, not a malformed body.
+            release_ephemeral_guard(Guard),
             flush_decode_result(Token),
             {'error', {'json_decoding_failed', Reason}}
     after WatchdogMs ->
@@ -658,6 +714,7 @@ decode_with_watchdog(Body, Bytes, Budget) ->
             receive
                 {'DOWN', MonitorRef, 'process', DecoderPid, _} -> 'ok'
             end,
+            release_ephemeral_guard(Guard),
             flush_decode_result(Token),
             {'error', 'timeout'}
     end.
@@ -1433,8 +1490,8 @@ request_guardian_await_start(Parent, LifecycleOwner, Token, Budget,
             %% (killed, crashed) before its cleanup ran must take the worker
             %% blocked in `hackney:request/5' and the lease that owns the
             %% transport down with it, or the socket survives them all.
-            guard_ephemeral_worker(self(), WorkerPid),
-            guard_ephemeral_worker(self(), LeasePid),
+            WorkerGuard = guard_ephemeral_worker(self(), WorkerPid),
+            LeaseGuard = guard_ephemeral_worker(self(), LeasePid),
             WorkerRef = erlang:monitor('process', WorkerPid),
             LeaseRef = erlang:monitor('process', LeasePid),
             notify_upload_worker(hook('upload', Hooks), WorkerPid),
@@ -1450,6 +1507,7 @@ request_guardian_await_start(Parent, LifecycleOwner, Token, Budget,
                       'worker_ref' => WorkerRef,
                       'lease_pid' => LeasePid,
                       'lease_ref' => LeaseRef,
+                      'guards' => [WorkerGuard, LeaseGuard],
                       'request_ref' => 'undefined',
                       'request' => Identity,
                       'hooks' => Hooks},
@@ -1620,6 +1678,7 @@ request_guardian_cleanup(#{'parent' := Parent,
                            'lease_ref' := LeaseRef,
                            'request_ref' := Ref,
                            'request' := Identity,
+                           'guards' := Guards,
                            'hooks' := Hooks}=State,
                          AckTarget, CleanupBudget, NotifyLifecycle) ->
     TestHook = hook('guardian_started', Hooks),
@@ -1635,6 +1694,12 @@ request_guardian_cleanup(#{'parent' := Parent,
                       CleanupBudget),
     case CleanupResult of
         'ok' ->
+            %% The worker and the lease are proven gone; their guards are
+            %% ended before anyone hears of it, so a caller that returns on
+            %% this verdict leaves none of them behind
+            %% (`release_ephemeral_guard/1'). An unproven cleanup keeps them:
+            %% the retrying guardian may still be killed.
+            lists:foreach(fun release_ephemeral_guard/1, Guards),
             notify_guardian_cleanup_test(TestHook, 'complete', Ref),
             maybe_log_recovered_cleanup(NotifyLifecycle, Ref, Identity),
             maybe_notify_lifecycle_cleanup(
@@ -2391,7 +2456,19 @@ guardian_cleanup_ack_relay(Parent, GuardianPid, CleanupToken, Budget) ->
                  TimeoutMs when TimeoutMs > 0 ->
                      receive
                          {'bounded_guardian_cleanup_ack', GuardianPid,
-                          CleanupToken, 'ok'} -> 'ok';
+                          CleanupToken, 'ok'} ->
+                             %% A guardian acknowledges `ok' only on its
+                             %% way out (`exit('normal')' follows both
+                             %% sends), so its `DOWN' is certain and the
+                             %% wait unconditional. Waited for here so the
+                             %% caller, which returns on this verdict, does
+                             %% not leave the guardian alive for a
+                             %% `hackney_process' owner to kill
+                             %% (`release_ephemeral_guard/1').
+                             receive
+                                 {'DOWN', GuardianMonitor, 'process',
+                                  GuardianPid, _Reason} -> 'ok'
+                             end;
                          {'bounded_guardian_cleanup_ack', GuardianPid,
                           CleanupToken, {'error', 'timeout'}} ->
                              {'error', 'timeout'};

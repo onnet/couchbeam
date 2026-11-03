@@ -34,8 +34,15 @@ run(Fun, #{'deadline_ms' := Deadline, 'timeout_ms' := Timeout}=Budget, Mode) ->
     Token = make_ref(),
     {Worker, Monitor} = hackney_process:spawn_monitor(
                           fun() ->
-                                  couchbeam_httpc:guard_ephemeral_worker(Parent, self()),
-                                  Parent ! {Token, invoke(Fun, Budget)}
+                                  Guard = couchbeam_httpc:guard_ephemeral_worker(
+                                            Parent, self()),
+                                  Outcome = invoke(Fun, Budget),
+                                  %% Ended before the answer, so the caller,
+                                  %% which returns once this worker is down,
+                                  %% leaves no guard behind for a
+                                  %% `hackney_process' owner to kill.
+                                  couchbeam_httpc:release_ephemeral_guard(Guard),
+                                  Parent ! {Token, Outcome}
                           end),
     %% Allow the existing transport cleanup protocol to finish after its raw
     %% deadline. This does not extend the deadline used by any I/O or decoder.

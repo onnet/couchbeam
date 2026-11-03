@@ -1960,6 +1960,226 @@ bounded_close_ends_lease_with_shutdown_test() ->
               end
       end).
 
+%% --- owned helpers end with the call ----------------------------------------
+%% Under a `hackney_process' owner (Kazoo zdocs) every helper a bounded call
+%% spawns is the owner's child, and the owner kills whatever is still alive
+%% when the operation's process ends; a supervisor logs each such kill as
+%% `child_terminated ... killed' (Kazoo prod core11, 03.11.2026: the guards of
+%% `guard_ephemeral_worker/2', about every second bounded write). The
+%% verdict is therefore the moment the call returns: no helper it spawned may
+%% still be alive. `with_recording_owner/1' stands in for the owner and
+%% records every pid; the check runs right after the return, without any
+%% wait, so it is only green when the call itself waited for its helpers.
+%% In production the stray helper was a scheduling race (a guard not yet
+%% scheduled to handle its worker's `DOWN'); the recording owner makes the
+%% race certain by holding every helper briefly after its job is done
+%% (`owned_helper_exit_hold_ms/0'), so a call that does not wait for a
+%% helper's `DOWN' returns while that helper is still alive.
+
+owned_helpers_end_with_bounded_encode_test() ->
+    {'ok', Budget} = couchbeam_httpc:new_request_budget({5000, 1024}),
+    assert_owned_helpers_end(
+      fun() ->
+              ?assertEqual({'ok', <<"{\"a\":1}">>},
+                           couchbeam_httpc:bounded_encode_json(
+                             {[{<<"a">>, 1}]}, Budget))
+      end, 2).
+
+owned_helpers_end_with_bounded_encode_error_test() ->
+    {'ok', Budget} = couchbeam_httpc:new_request_budget({5000, 1024}),
+    assert_owned_helpers_end(
+      fun() ->
+              ?assertMatch({'error', {'invalid_json_encoding', _}},
+                           couchbeam_httpc:bounded_encode_json(
+                             {[{<<"a">>, self()}]}, Budget))
+      end, 2).
+
+owned_helpers_end_with_bounded_decode_test() ->
+    Body = <<"{\"a\":1}">>,
+    {'ok', Budget} = couchbeam_httpc:new_request_budget({5000, 1024}),
+    assert_owned_helpers_end(
+      fun() ->
+              ?assertEqual({'ok', {[{<<"a">>, 1}]}, byte_size(Body)},
+                           couchbeam_httpc:decode_bounded_json(
+                             Body, byte_size(Body), Budget))
+      end, 2).
+
+owned_helpers_end_with_bounded_decode_error_test() ->
+    Body = <<"{\"a\":">>,
+    {'ok', Budget} = couchbeam_httpc:new_request_budget({5000, 1024}),
+    assert_owned_helpers_end(
+      fun() ->
+              ?assertMatch({'error', _},
+                           couchbeam_httpc:decode_bounded_json(
+                             Body, byte_size(Body), Budget))
+      end, 2).
+
+owned_helpers_end_with_receipt_call_test() ->
+    Spec = {'bounded_reader', 2,
+            erlang:monotonic_time('millisecond') + 1000, 1024},
+    assert_owned_helpers_end(
+      fun() ->
+              ?assertMatch({'ok', 'value', _},
+                           couchbeam_receipt:call(
+                             fun({'receipt_budget', _}) ->
+                                     {'ok', 'value', 0}
+                             end, Spec, 'direct'))
+      end, 2).
+
+%% The whole Kazoo path: receipt worker, request guardian, transport lease,
+%% request worker, cleanup relay, encoder and decoder, and the view stream
+%% with its decoder -- each with the guards it spawns.
+owned_helpers_end_with_v2_calls_test_() ->
+    [{atom_to_list(Kind),
+      ?_test(owned_helpers_end_with_v2_call(Kind, Body))}
+     || {Kind, Body} <- [{'db', <<"{}">>}, {'doc', <<"{}">>},
+                        {'save', <<"{\"id\":\"doc\",\"rev\":\"1-a\"}">>},
+                        {'view', <<"{\"rows\":[]}">>}]].
+
+owned_helpers_end_with_v2_call(Kind, Body) ->
+    ensure_couchbeam_supervisor(),
+    with_http_server(
+      fun(Socket, Parent) ->
+              Status = case Kind of 'save' -> 201; _ -> 200 end,
+              'ok' = send_json_headers(Socket, Status, byte_size(Body)),
+              'ok' = gen_tcp:send(Socket, Body),
+              Parent ! {'server_done', self()}
+      end,
+      fun(Url) ->
+              Db = v2_db(Url),
+              {Result, Owned, Alive} =
+                  with_recording_owner(
+                    fun() -> v2_call(Kind, Db, v2_spec(1000, 128)) end),
+              ?assertMatch({'ok', _, _}, Result),
+              ?assertMatch([_, _ | _], Owned),
+              ?assertEqual([], [{Pid, process_info(Pid, 'current_stacktrace')}
+                                || Pid <- Alive])
+      end).
+
+%% The request guardian acknowledges a completed cleanup and only then exits;
+%% the cleanup relay used to hand the caller its verdict on the
+%% acknowledgement alone, so `close_request/1' could return while the guardian
+%% was still on its way out. Here the guardian alone is held long after its
+%% acknowledgement, which makes that window certain.
+owned_guardian_ends_with_close_request_test() ->
+    {'ok', _} = application:ensure_all_started('hackney'),
+    Body = <<"ok">>,
+    with_http_server(
+      fun(Socket, Parent) ->
+              send_json_response(Socket, Body),
+              Parent ! {'server_done', self()}
+      end,
+      fun(BaseUrl) ->
+              {'ok', Budget} = couchbeam_httpc:new_request_budget({1000, 1000}),
+              {Guardian, _Owned, Alive} =
+                  with_recording_owner(
+                    fun(HoldTable) ->
+                            {'ok', 200, _, Ref} =
+                                couchbeam_httpc:bounded_request(
+                                  'get', BaseUrl, [], <<>>,
+                                  [{'no_proxy_env', 'true'}], Budget),
+                            {_Lease, GuardianPid, _} =
+                                get({'bounded_request_owner', Ref}),
+                            'true' = ets:insert(
+                                       HoldTable,
+                                       {{'hold', GuardianPid}, 200}),
+                            ?assertEqual(
+                               {'ok', Body, byte_size(Body)},
+                               couchbeam_httpc:bounded_binary_body(
+                                 Ref, Budget)),
+                            GuardianPid
+                    end),
+              ?assertNot(is_process_alive(Guardian)),
+              ?assertEqual([], Alive)
+      end).
+
+%% The guard's protection is unchanged by its release: a receipt caller killed
+%% while its worker runs still takes the worker down (the worker spawns its
+%% own guard, unlike the encoder and decoder covered by
+%% `bounded_json_encoder_dies_with_its_caller/0' and
+%% `bounded_json_decoder_dies_with_its_caller/0').
+receipt_worker_dies_with_its_caller_test() ->
+    Self = self(),
+    Spec = {'bounded_reader', 2,
+            erlang:monotonic_time('millisecond') + 1000, 1024},
+    Caller = spawn(
+               fun() ->
+                       couchbeam_receipt:call(
+                         fun({'receipt_budget', _}) ->
+                                 Self ! {'receipt_worker', self()},
+                                 receive 'never' -> 'ok' end
+                         end, Spec, 'direct')
+               end),
+    Worker = receive {'receipt_worker', Pid} -> Pid
+             after 1000 -> erlang:error('no_receipt_worker')
+             end,
+    WorkerRef = erlang:monitor('process', Worker),
+    exit(Caller, 'kill'),
+    receive
+        {'DOWN', WorkerRef, 'process', Worker, Reason} ->
+            ?assertEqual('killed', Reason)
+    after 1000 ->
+            erlang:error('receipt_worker_survived_its_caller')
+    end.
+
+assert_owned_helpers_end(CallFun, MinHelpers) ->
+    lists:foreach(
+      fun(_) ->
+              {_, Owned, Alive} = with_recording_owner(CallFun),
+              ?assert(length(Owned) >= MinHelpers),
+              ?assertEqual([], Alive)
+      end, lists:seq(1, 3)),
+    %% Nothing the helpers sent may be left behind for the caller.
+    ?assertEqual([], element(2, process_info(self(), 'messages'))).
+
+%% A `hackney_process' owner like Kazoo's: `Start' creates the helper blocked
+%% and `Go' releases it (`hackney_process:spawn/1'). Every helper is recorded,
+%% nested ones included (they run under the same owner), and is held for
+%% `owned_helper_exit_hold_ms/0' after its function returned or exited, as a
+%% helper that is slow to finish its exit. A killed helper is not held.
+%% Answers the call's result, every recorded pid, and those alive at the
+%% moment it returned.
+%% A `CallFun' of arity one gets the table and may give one helper its own
+%% hold by inserting `{{'hold', Pid}, Ms}'.
+with_recording_owner(CallFun) ->
+    Table = ets:new('owned_helpers', ['public', 'bag']),
+    Start = fun(Body) ->
+                    Token = make_ref(),
+                    Pid = spawn(fun() ->
+                                        receive
+                                            {Token, 'go'} ->
+                                                try Body()
+                                                after
+                                                    owned_helper_exit_hold(
+                                                      Table)
+                                                end
+                                        end
+                                end),
+                    'true' = ets:insert(Table, {'helper', Pid}),
+                    {'ok', Pid, Token}
+            end,
+    Go = fun(Pid, Token) -> Pid ! {Token, 'go'}, 'ok' end,
+    Call = case is_function(CallFun, 1) of
+               'true' -> fun() -> CallFun(Table) end;
+               'false' -> CallFun
+           end,
+    Result = hackney_process:with_owner({Start, Go}, Call),
+    Owned = [Pid || {'helper', Pid} <- ets:lookup(Table, 'helper')],
+    Alive = [Pid || Pid <- Owned, is_process_alive(Pid)],
+    ets:delete(Table),
+    {Result, Owned, Alive}.
+
+owned_helper_exit_hold(Table) ->
+    %% `catch': a helper that outlived the call finds the table deleted.
+    Hold = case catch ets:lookup(Table, {'hold', self()}) of
+               [{_, Ms}] -> Ms;
+               _ -> owned_helper_exit_hold_ms()
+           end,
+    receive after Hold -> 'ok' end.
+
+owned_helper_exit_hold_ms() ->
+    20.
+
 bounded_view_of_exactly_max_bytes_succeeds_test() ->
     ensure_couchbeam_supervisor(),
     Body = <<"{\"total_rows\":0,\"offset\":0,\"rows\":[]}">>,

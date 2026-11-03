@@ -355,8 +355,8 @@ decode_data_bounded(Data, #state{decoder=Decoder,
     %% Same rule as the two killable workers in `couchbeam_httpc': a decoder
     %% whose stream process died has nobody to answer and must not keep
     %% chewing through a chunk that may be as large as `max_response_bytes'.
-    couchbeam_httpc:guard_ephemeral_worker(Parent, DecoderPid),
-    await_bounded_decode(Token, DecoderPid, MonitorRef, State).
+    Guard = couchbeam_httpc:guard_ephemeral_worker(Parent, DecoderPid),
+    await_bounded_decode(Token, DecoderPid, MonitorRef, Guard, State).
 
 -spec bounded_decode_result(binary(), 'complete' | fun((term()) -> term())) ->
           {'ok', 'complete' | fun((term()) -> term())} | {'error', term()}.
@@ -395,14 +395,24 @@ bounded_decoder_result(DecodeFun) ->
             {'error', {'malformed_view', {Class, Reason}}}
     end.
 
--spec await_bounded_decode(reference(), pid(), reference(), #state{}) ->
-          'ok' | no_return().
-await_bounded_decode(Token, DecoderPid, MonitorRef,
+%% Every branch ends the decoder's guard (`couchbeam_httpc:
+%% release_ephemeral_guard/1') once the decoder is gone, before the stream
+%% goes on or exits: under a `hackney_process' owner both are the owner's
+%% helpers, and one still alive when the operation ends is killed and logged
+%% as a crash.
+-spec await_bounded_decode(reference(), pid(), reference(), pid(),
+                           #state{}) -> 'ok' | no_return().
+await_bounded_decode(Token, DecoderPid, MonitorRef, Guard,
                      #state{ref=StreamRef, mref=OwnerRef}=State) ->
     Timeout = receive_timeout(State),
     receive
         {Token, Result} ->
-            erlang:demonitor(MonitorRef, ['flush']),
+            %% The decoder exits right after this send; its row messages
+            %% were sent before it, so they are all here once it is gone.
+            receive
+                {'DOWN', MonitorRef, 'process', DecoderPid, _Exit} -> 'ok'
+            end,
+            couchbeam_httpc:release_ephemeral_guard(Guard),
             Rows = take_decoder_rows(StreamRef, []),
             finish_bounded_decode(Result, Rows, State);
         {'DOWN', OwnerRef, 'process', _Owner, _Reason} ->
@@ -413,6 +423,7 @@ await_bounded_decode(Token, DecoderPid, MonitorRef,
             receive
                 {'DOWN', MonitorRef, 'process', DecoderPid, _Down} -> 'ok'
             end,
+            couchbeam_httpc:release_ephemeral_guard(Guard),
             flush_bounded_decode_result(Token),
             discard_decoder_rows(StreamRef),
             _ = maybe_close_after_owner_down(State),
@@ -421,6 +432,7 @@ await_bounded_decode(Token, DecoderPid, MonitorRef,
             %% `bounded_decode_result/2' catches its own decoding errors; a
             %% `'DOWN'' is a decoder killed from outside — transient, not a
             %% malformed view. Same label as the document door.
+            couchbeam_httpc:release_ephemeral_guard(Guard),
             flush_bounded_decode_result(Token),
             discard_decoder_rows(StreamRef),
             fail_stream({'json_decoding_failed', Reason}, State)
@@ -429,6 +441,7 @@ await_bounded_decode(Token, DecoderPid, MonitorRef,
             receive
                 {'DOWN', MonitorRef, 'process', DecoderPid, _Reason} -> 'ok'
             end,
+            couchbeam_httpc:release_ephemeral_guard(Guard),
             flush_bounded_decode_result(Token),
             discard_decoder_rows(StreamRef),
             fail_stream('timeout', State)
